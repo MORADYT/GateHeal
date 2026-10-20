@@ -1,0 +1,48 @@
+platform:
+  controller_mode: "deterministic"
+  max_allowed_impact_tier: 2
+  min_confidence_for_mutation: 0.70
+
+budgets:
+  per_action_timeout_sec: 10.0
+  total_incident_timeout_sec: 45.0
+  max_diagnostic_attempts: 4
+  max_recovery_attempts: 2
+  max_llm_requests: 0
+  max_agent_rounds: 0
+  max_evidence_bytes: 16384
+  max_log_lines: 50
+  verification_soak_sec: 5.0
+
+inventory:
+  services:
+    lab-redis.service:
+      unit_name: "lab-redis.service"
+      health_check_tcp_port: 6379
+      supports_reload: false
+      config_check_argv: []
+      upstream_dependencies: []
+      downstream_dependents:
+        - "lab-api.service"
+
+    lab-api.service:
+      unit_name: "lab-api.service"
+      health_check_http_url: "http://127.0.0.1:8080/healthz"
+      supports_reload: true
+      config_check_argv:
+        - "/usr/local/bin/lab-api"
+        - "--validate-config"
+        - "/etc/lab-api/config.yaml"
+      upstream_dependencies:
+        - "lab-redis.service"
+      downstream_dependents:
+        - "lab-worker.service"
+
+    lab-worker.service:
+      unit_name: "lab-worker.service"
+      health_check_tcp_port: 8081
+      supports_reload: false
+      config_check_argv: []
+      upstream_dependencies:
+        - "lab-api.service"
+      downstream_dependents: []

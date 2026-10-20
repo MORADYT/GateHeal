@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gateheal"
+version = "0.1.0"
+description = "Policy-gated, minimal-impact Linux self-healing platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.9.0,<3.0.0",
+    "pyyaml>=6.0.2,<7.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13.0,<2.0.0",
+    "pytest>=8.3.0,<9.0.0",
+    "ruff>=0.7.0,<1.0.0",
+    "types-PyYAML>=6.0.12",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13.0,<2.0.0",
+    "pytest>=8.3.0,<9.0.0",
+    "ruff>=0.7.0,<1.0.0",
+    "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+gateheal = "gateheal.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateheal"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
