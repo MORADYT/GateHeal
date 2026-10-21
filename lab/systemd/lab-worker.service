@@ -1,0 +1,13 @@
+[Unit]
+Description=GateHeal Isolated Lab Worker Service (Coupled to lab-api)
+After=lab-api.service
+Requires=lab-api.service
+BindsTo=lab-api.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m gateheal.lab_daemons --role worker --host 127.0.0.1 --port 8081
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

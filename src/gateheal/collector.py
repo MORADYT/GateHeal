@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from gateheal.config import GateHealConfig
 from gateheal.models import IncidentRecord, ServiceEvidence
+from gateheal.transport import CommandTransport
 
 SECRET_PATTERNS = (
     re.compile(
@@ -22,6 +23,18 @@ SECRET_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+
+
+def parse_systemctl_show(raw_output: str) -> dict[str, str]:
+    """Parse Key=Value lines emitted by `systemctl show`."""
+    parsed: dict[str, str] = {}
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if not stripped or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        parsed[key.strip()] = value.strip()
+    return parsed
 
 
 class IncidentCollector:
@@ -83,6 +96,95 @@ class IncidentCollector:
             target_unit=target_unit,
             collected_at_utc=now_utc,
             services=sanitized_services,
+            prior_diagnostic_attempts=prior_diagnostic_attempts,
+            prior_recovery_attempts=prior_recovery_attempts,
+            action_history=action_history,
+            elapsed_sec=elapsed_sec,
+        )
+
+    def collect_from_transport(
+        self,
+        incident_id: str,
+        target_unit: str,
+        transport: CommandTransport,
+        prior_diagnostic_attempts: int = 0,
+        prior_recovery_attempts: int = 0,
+        action_history: tuple[str, ...] = (),
+        elapsed_sec: float = 0.0,
+    ) -> IncidentRecord:
+        """Collect live systemd unit state, config checks, and logs via transport."""
+        raw_services: dict[str, ServiceEvidence] = {}
+        timeout = min(5.0, self._config.budgets.per_action_timeout_sec)
+        max_lines = self._config.budgets.max_log_lines
+
+        for unit, item in self._config.inventory.services.items():
+            show_res = transport.run(
+                (
+                    "systemctl",
+                    "show",
+                    unit,
+                    "--property=ActiveState,SubState,Result,NRestarts,CanReload",
+                ),
+                timeout_sec=timeout,
+            )
+            props = parse_systemctl_show(show_res.stdout_excerpt)
+            active_state = props.get("ActiveState", "unknown")
+            sub_state = props.get("SubState", "unknown")
+            result_prop = props.get("Result", "unknown")
+            try:
+                n_restarts = max(0, int(props.get("NRestarts", "0")))
+            except ValueError:
+                n_restarts = 0
+            can_reload = props.get("CanReload", "no").lower() == "yes"
+
+            config_valid: bool | None = None
+            if item.config_check_argv:
+                cfg_res = transport.run(item.config_check_argv, timeout_sec=timeout)
+                config_valid = cfg_res.exit_code == 0 and not cfg_res.timed_out
+
+            probe_ok = active_state == "active" and sub_state == "running"
+            if item.health_check_http_url:
+                http_res = transport.run(
+                    ("curl", "-fsS", "--max-time", "2", item.health_check_http_url),
+                    timeout_sec=timeout,
+                )
+                probe_ok = http_res.exit_code == 0 and not http_res.timed_out
+
+            log_res = transport.run(
+                (
+                    "journalctl",
+                    "-u",
+                    unit,
+                    "-n",
+                    str(max_lines),
+                    "--no-pager",
+                    "-o",
+                    "cat",
+                ),
+                timeout_sec=timeout,
+            )
+            log_lines = tuple(
+                line
+                for line in log_res.stdout_excerpt.splitlines()
+                if line.strip()
+            )
+
+            raw_services[unit] = ServiceEvidence(
+                unit_name=unit,
+                active_state=active_state,
+                sub_state=sub_state,
+                result=result_prop,
+                n_restarts=n_restarts,
+                can_reload=can_reload,
+                health_probe_ok=probe_ok,
+                config_valid=config_valid,
+                sanitized_logs=log_lines,
+            )
+
+        return self.collect_simulated(
+            incident_id=incident_id,
+            target_unit=target_unit,
+            simulated_services=raw_services,
             prior_diagnostic_attempts=prior_diagnostic_attempts,
             prior_recovery_attempts=prior_recovery_attempts,
             action_history=action_history,

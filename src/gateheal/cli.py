@@ -17,6 +17,11 @@ from gateheal.controller import (
     OutcomeVerifier,
 )
 from gateheal.diagnosis import DiagnosisEngine
+from gateheal.experiments import (
+    ExperimentRunner,
+    build_default_scenarios,
+    compute_campaign_metrics,
+)
 from gateheal.models import (
     ActionId,
     ActionProposal,
@@ -132,6 +137,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional explicit action_id to test policy gate approval/rejection.",
+    )
+
+    exp_parser = subparsers.add_parser(
+        "run-experiment",
+        help="Run repeatable Phase 3 pilot campaign comparing Config A vs Config B.",
+    )
+    exp_parser.add_argument(
+        "--config", type=Path, required=True, help="Path to YAML config."
+    )
+    exp_parser.add_argument(
+        "--trials",
+        type=int,
+        default=5,
+        help="Number of repeated trials per scenario (default: 5).",
+    )
+    exp_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts/phase3_pilot_summary.json"),
+        help="Path to write JSON experiment summary.",
     )
     return parser
 
@@ -267,6 +292,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         recorder.record(audit_rec)
         print(json.dumps(audit_rec.model_dump(), indent=2))
+        return 0
+
+    if args.command == "run-experiment":
+        cfg = load_config(args.config)
+        scenarios = build_default_scenarios()
+        scenarios_by_id = {s.scenario_id: s for s in scenarios}
+        runner = ExperimentRunner(
+            cfg,
+            audit_path=Path("artifacts/phase3_experiment_audit.jsonl"),
+        )
+
+        summaries: dict[str, object] = {}
+        for mode in (
+            "config_a_fixed_runbook",
+            "config_b_deterministic_risk_aware",
+        ):
+            mode_outcomes = []
+            for trial_idx in range(1, args.trials + 1):
+                for scen in scenarios:
+                    outcome = runner.run_single_trial(
+                        scen,
+                        config_name=mode,
+                        trial_index=trial_idx,
+                    )
+                    mode_outcomes.append(outcome)
+            metrics = compute_campaign_metrics(mode, mode_outcomes, scenarios_by_id)
+            summaries[mode] = metrics.model_dump()
+
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(summaries, indent=2),
+            encoding="utf-8",
+        )
+        print(json.dumps(summaries, indent=2))
         return 0
 
     return 1
