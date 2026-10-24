@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from types import MappingProxyType
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +20,7 @@ class ActionSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     action_id: ActionId
+    enabled: bool = True
     impact_tier: ImpactTier
     required_permission: PermissionTier
     requires_target_unit: bool = True
@@ -37,8 +40,11 @@ class ActionSpec(BaseModel):
         service_spec: ServiceInventoryItem | None,
     ) -> tuple[str, ...]:
         """Construct a safe argument vector without shell interpolation."""
-        if self.action_id == ActionId.ABSTAIN_AND_ESCALATE:
+        if self.action_id in (ActionId.NO_OP, ActionId.ABSTAIN_AND_ESCALATE):
             return ()
+
+        if not self.enabled:
+            raise ValueError(f"Action {self.action_id} is disabled and has no argv.")
 
         if target_unit is None or not UNIT_NAME_RE.fullmatch(target_unit):
             raise ValueError(f"Invalid or missing systemd unit name: {target_unit!r}")
@@ -64,17 +70,29 @@ class ActionSpec(BaseModel):
             )
 
         if self.action_id == ActionId.RELOAD_SERVICE:
-            return ("systemctl", "reload", target_unit)
+            return ("sudo", "-n", "/usr/bin/systemctl", "reload", target_unit)
 
         if self.action_id == ActionId.RESTART_SERVICE:
-            return ("systemctl", "restart", target_unit)
+            return ("sudo", "-n", "/usr/bin/systemctl", "restart", target_unit)
 
         raise ValueError(f"Unsupported action_id: {self.action_id}")
 
 
-DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
+_CATALOGUE_ENTRIES: dict[ActionId, ActionSpec] = {
+    ActionId.NO_OP: ActionSpec(
+        action_id=ActionId.NO_OP,
+        enabled=True,
+        impact_tier=ImpactTier.READ_ONLY_DIAGNOSTIC,
+        required_permission=PermissionTier.READ_ONLY,
+        requires_target_unit=False,
+        reversible=True,
+        timeout_sec=1.0,
+        max_retries_per_incident=5,
+        description="Explicit no-operation when target service is verified healthy.",
+    ),
     ActionId.INSPECT_SERVICE_STATUS: ActionSpec(
         action_id=ActionId.INSPECT_SERVICE_STATUS,
+        enabled=True,
         impact_tier=ImpactTier.READ_ONLY_DIAGNOSTIC,
         required_permission=PermissionTier.READ_ONLY,
         requires_target_unit=True,
@@ -85,6 +103,7 @@ DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
     ),
     ActionId.VALIDATE_SERVICE_CONFIG: ActionSpec(
         action_id=ActionId.VALIDATE_SERVICE_CONFIG,
+        enabled=True,
         impact_tier=ImpactTier.READ_ONLY_DIAGNOSTIC,
         required_permission=PermissionTier.READ_ONLY,
         requires_target_unit=True,
@@ -95,6 +114,7 @@ DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
     ),
     ActionId.CHECK_DEPENDENCY_HEALTH: ActionSpec(
         action_id=ActionId.CHECK_DEPENDENCY_HEALTH,
+        enabled=True,
         impact_tier=ImpactTier.READ_ONLY_DIAGNOSTIC,
         required_permission=PermissionTier.READ_ONLY,
         requires_target_unit=True,
@@ -103,8 +123,20 @@ DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
         max_retries_per_incident=3,
         description="Check whether a declared upstream dependency unit is active.",
     ),
+    ActionId.RESTORE_LAST_KNOWN_GOOD_CONFIG: ActionSpec(
+        action_id=ActionId.RESTORE_LAST_KNOWN_GOOD_CONFIG,
+        enabled=False,
+        impact_tier=ImpactTier.GRACEFUL_RELOAD_OR_RESTORE,
+        required_permission=PermissionTier.SERVICE_OPERATOR,
+        requires_target_unit=True,
+        reversible=True,
+        timeout_sec=5.0,
+        max_retries_per_incident=1,
+        description="Disabled until atomic hash-verified file restore executor exists.",
+    ),
     ActionId.RELOAD_SERVICE: ActionSpec(
         action_id=ActionId.RELOAD_SERVICE,
+        enabled=True,
         impact_tier=ImpactTier.GRACEFUL_RELOAD_OR_RESTORE,
         required_permission=PermissionTier.SERVICE_OPERATOR,
         requires_target_unit=True,
@@ -118,6 +150,7 @@ DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
     ),
     ActionId.RESTART_SERVICE: ActionSpec(
         action_id=ActionId.RESTART_SERVICE,
+        enabled=True,
         impact_tier=ImpactTier.TARGETED_RESTART,
         required_permission=PermissionTier.SERVICE_OPERATOR,
         requires_target_unit=True,
@@ -130,6 +163,7 @@ DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
     ),
     ActionId.ABSTAIN_AND_ESCALATE: ActionSpec(
         action_id=ActionId.ABSTAIN_AND_ESCALATE,
+        enabled=True,
         impact_tier=ImpactTier.READ_ONLY_DIAGNOSTIC,
         required_permission=PermissionTier.HUMAN_ESCALATION,
         requires_target_unit=False,
@@ -139,3 +173,7 @@ DEFAULT_ACTION_CATALOGUE: dict[ActionId, ActionSpec] = {
         description="Stop automated mutation and escalate the incident for human review.",
     ),
 }
+
+DEFAULT_ACTION_CATALOGUE: Mapping[ActionId, ActionSpec] = MappingProxyType(
+    _CATALOGUE_ENTRIES
+)

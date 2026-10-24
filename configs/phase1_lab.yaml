@@ -2,6 +2,7 @@ platform:
   controller_mode: "deterministic"
   max_allowed_impact_tier: 2
   min_confidence_for_mutation: 0.70
+  max_unapproved_blast_radius_weight: 0.0
 
 budgets:
   per_action_timeout_sec: 10.0
@@ -12,7 +13,13 @@ budgets:
   max_agent_rounds: 0
   max_evidence_bytes: 16384
   max_log_lines: 50
+  max_log_line_bytes: 512
   verification_soak_sec: 5.0
+  verification_poll_interval_sec: 1.0
+  startup_grace_sec: 5.0
+  cooldown_sec: 30.0
+  flap_window_sec: 120.0
+  flap_max_restarts: 3
 
 inventory:
   services:
@@ -20,7 +27,9 @@ inventory:
       unit_name: "lab-redis.service"
       health_check_tcp_port: 6379
       supports_reload: false
+      config_check_mode: "acknowledged_none"
       config_check_argv: []
+      criticality_weight: 1.0
       upstream_dependencies: []
       downstream_dependents:
         - "lab-api.service"
@@ -29,10 +38,16 @@ inventory:
       unit_name: "lab-api.service"
       health_check_http_url: "http://127.0.0.1:8080/healthz"
       supports_reload: true
+      config_check_mode: "argv"
+      config_invalid_exit_code: 65
       config_check_argv:
-        - "/usr/local/bin/lab-api"
+        - "/usr/bin/python3"
+        - "-m"
+        - "gateheal.lab_daemons"
         - "--validate-config"
         - "/etc/lab-api/config.yaml"
+      known_good_config_backup_path: "/etc/gateheal/backups/lab-api-config.yaml"
+      criticality_weight: 1.0
       upstream_dependencies:
         - "lab-redis.service"
       downstream_dependents:
@@ -42,7 +57,9 @@ inventory:
       unit_name: "lab-worker.service"
       health_check_tcp_port: 8081
       supports_reload: false
+      config_check_mode: "acknowledged_none"
       config_check_argv: []
+      criticality_weight: 1.0
       upstream_dependencies:
         - "lab-api.service"
       downstream_dependents: []

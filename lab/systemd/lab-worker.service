@@ -1,8 +1,7 @@
 [Unit]
-Description=GateHeal Isolated Lab Worker Service (Coupled to lab-api)
+Description=GateHeal Isolated Lab Worker Service
 After=lab-api.service
-Requires=lab-api.service
-BindsTo=lab-api.service
+Wants=lab-api.service
 
 [Service]
 Type=simple

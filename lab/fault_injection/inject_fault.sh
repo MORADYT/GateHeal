@@ -15,7 +15,7 @@ case "$SCENARIO" in
         echo "invalid_yaml: [unclosed" > /etc/lab-api/config.yaml
         ;;
     S3_DEPENDENCY_FAILURE)
-        systemctl stop lab-redis.service
+        systemctl kill -s SIGKILL lab-redis.service
         ;;
     S4_PERSISTENT_FAILURE)
         echo "listen_port: 'not_an_int'" > /etc/lab-api/config.yaml
