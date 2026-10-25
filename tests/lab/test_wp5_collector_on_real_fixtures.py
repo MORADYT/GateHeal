@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -11,19 +12,67 @@ from gateheal.collector import IncidentCollector, parse_systemctl_show
 from gateheal.config import load_config
 from gateheal.diagnosis import DiagnosisEngine
 from gateheal.models import FaultClass
+from gateheal.transport import TransportResult
 
 pytestmark = pytest.mark.lab
 
 
-def test_wp5_collector_and_diagnosis_on_real_vm_fixtures() -> None:
-    """F3: Feed captured VM systemctl show fixtures into IncidentCollector and DiagnosisEngine."""
+class _FixtureCommandTransport:
+    """Transport keyed by argv returning captured raw outputs from real VM fixtures."""
+
+    def __init__(self, shows: dict[str, str], probes: dict[str, object] | None = None) -> None:
+        self._shows = shows
+        self._probes = probes or {}
+
+    def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
+        _ = timeout_sec
+        cmd = tuple(argv)
+        if cmd[:2] == ("cat", "/proc/uptime"):
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt=str(self._probes.get("uptime", "50000.0 40000.0\n")),
+            )
+        if cmd[:2] == ("systemctl", "show"):
+            u = cmd[2]
+            excerpt = self._shows.get(u, "")
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt=str(excerpt),
+            )
+        if "--validate-config" in cmd:
+            return TransportResult(
+                exit_code=int(self._probes.get("validate_config_exit", 0)),
+                duration_sec=0.01,
+            )
+        if cmd[0] == "curl":
+            return TransportResult(
+                exit_code=0 if "200" in str(self._probes.get("curl_healthz", "")) else 22,
+                duration_sec=0.01,
+                stdout_excerpt=str(self._probes.get("curl_healthz", "")),
+            )
+        if "--check-tcp" in cmd:
+            port = cmd[-1]
+            code = (
+                int(self._probes.get("tcp_6379_exit", 0))
+                if port == "6379"
+                else int(self._probes.get("tcp_8081_exit", 0))
+            )
+            return TransportResult(exit_code=code, duration_sec=0.01)
+        return TransportResult(exit_code=0, duration_sec=0.01)
+
+
+def test_wp5_collector_on_real_fixtures() -> None:
+    """F3: Feed captured VM outputs via IncidentCollector.collect_from_transport."""
     repo_root = Path(__file__).resolve().parents[2]
     cfg = load_config(repo_root / "configs" / "phase1_lab.yaml")
     fixture_path = repo_root / "tests" / "lab" / "fixtures" / "vm_captured_systemd_facts.json"
     assert fixture_path.is_file()
 
     payload = json.loads(fixture_path.read_text(encoding="utf-8"))
-    scen_shows = payload["scenarios_systemctl_show"]
+    scen_shows = payload.get("scenarios_systemctl_show", {})
+    scen_probes = payload.get("scenarios_probes", {})
     assert isinstance(scen_shows, dict)
 
     expected_fault_classes = {
@@ -40,53 +89,22 @@ def test_wp5_collector_and_diagnosis_on_real_vm_fixtures() -> None:
     diagnosis_engine = DiagnosisEngine(cfg)
 
     for scen_id, expected_fault in expected_fault_classes.items():
-        unit_map = scen_shows.get(scen_id, scen_shows.get("S1_SERVICE_CRASH", {}))
+        if scen_id not in scen_shows:
+            pytest.skip(f"Fixture lacks captured systemctl show output for scenario {scen_id}")
+
+        unit_map = scen_shows[scen_id]
+        probes = scen_probes.get(scen_id, {})
         assert isinstance(unit_map, dict)
 
-        simulated_services: dict[str, object] = {}
-        for unit_name in cfg.inventory.services:
-            raw_show = str(unit_map.get(unit_name, ""))
-            props = parse_systemctl_show(raw_show)
-            active = props.get("ActiveState", "active")
-            sub = props.get("SubState", "running")
-            res = props.get("Result", "success")
-            n_rst = int(props.get("NRestarts", "0"))
-            can_rel = props.get("CanReload", "no").lower() == "yes"
+        transport = _FixtureCommandTransport(unit_map, probes)
+        target_unit = "lab-api.service" if scen_id != "S3_DEPENDENCY_FAILURE" else "lab-redis.service"
 
-            # In S2 / S4, config is invalid
-            cfg_valid: bool | None = True
-            if scen_id in ("S2_INVALID_CONFIG", "S4_PERSISTENT_FAILURE") and unit_name == "lab-api.service":
-                cfg_valid = False
-
-            # In S3, redis is failed
-            probe_ok = active == "active" and sub == "running"
-            if scen_id == "S3_DEPENDENCY_FAILURE" and unit_name == "lab-redis.service":
-                probe_ok = False
-                active = "failed"
-            if scen_id == "S1_SERVICE_CRASH" and unit_name == "lab-api.service":
-                probe_ok = False
-                active = "failed"
-            if scen_id == "S5_COLLATERAL_TRAP" and unit_name == "lab-api.service":
-                probe_ok = False # degraded running
-
-            from gateheal.models import ServiceEvidence
-            simulated_services[unit_name] = ServiceEvidence(
-                unit_name=unit_name,
-                active_state=active,
-                sub_state=sub,
-                result=res,
-                n_restarts=n_rst,
-                can_reload=can_rel,
-                health_probe_ok=probe_ok,
-                config_valid=cfg_valid,
-            )
-
-        incident = collector.collect_simulated(
+        incident = collector.collect_from_transport(
             incident_id=f"replay-{scen_id.lower()}",
-            target_unit="lab-api.service" if scen_id != "S3_DEPENDENCY_FAILURE" else "lab-redis.service",
-            simulated_services=simulated_services,
+            target_unit=target_unit,
+            transport=transport,
         )
         diag = diagnosis_engine.diagnose(incident)
-        # For S0, S1, S2, S3, S5, verify diagnosed fault matches expected
-        if scen_id in ("S0_HEALTHY_CONTROL", "S1_SERVICE_CRASH", "S2_INVALID_CONFIG", "S3_DEPENDENCY_FAILURE", "S5_COLLATERAL_TRAP"):
-            assert diag.fault_class == expected_fault, f"Scenario {scen_id} diagnosed {diag.fault_class}, expected {expected_fault}"
+        assert diag.fault_class == expected_fault, (
+            f"Scenario {scen_id} diagnosed {diag.fault_class}, expected {expected_fault}"
+        )
