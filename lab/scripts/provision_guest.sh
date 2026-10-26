@@ -65,7 +65,7 @@ systemctl enable lab-redis.service lab-api.service lab-worker.service >/dev/null
 export GATEHEAL_INSIDE_LAB=1
 bash "${REPO_ROOT}/lab/reset/reset_lab.sh"
 chmod 0644 /etc/lab-api/config.yaml
-echo "PROVISION_OK: GateHeal isolated lab guest is ready (root locked to from=\"127.0.0.1\" harness key)."#!/usr/bin/env bash
+echo "PROVISION_OK: GateHeal isolated lab guest is ready."#!/usr/bin/env bash
 # Provision an isolated Ubuntu 24.04 QEMU/KVM guest for GateHeal WP5.
 set -euo pipefail
 

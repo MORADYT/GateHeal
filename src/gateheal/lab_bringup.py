@@ -17,7 +17,7 @@ from gateheal.collector import parse_systemctl_show
 from gateheal.models import ActionId, FaultClass, VerificationStatus
 from gateheal.transport import CommandTransport
 
-DEFAULT_PINNED_UBUNTU_RELEASE = "current"
+DEFAULT_PINNED_UBUNTU_RELEASE = "release-20250219"
 
 
 class ConformanceFactResult(BaseModel):

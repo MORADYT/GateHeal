@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-side WP5 runner: executes conformance, multiplexed latency, S0-S5B smoke matrix, and manifest."""
+"""Host-side WP5 runner: conformance, multiplexed latency, S0-S5B smoke matrix, and manifest."""
 
 from __future__ import annotations
 
@@ -13,9 +13,11 @@ import time
 import uuid
 from pathlib import Path
 
+from gateheal.collector import IncidentCollector
 from gateheal.config import load_config
 from gateheal.controller import AuditRecorder, EscalationSink, default_artifacts_dir
 from gateheal.lab_bringup import (
+    DEFAULT_PINNED_UBUNTU_RELEASE,
     ConformanceFactResult,
     SmokeScenarioRunResult,
     build_lab_run_manifest,
@@ -26,17 +28,26 @@ from gateheal.lab_bringup import (
 )
 from gateheal.models import ActionId
 from gateheal.orchestrator import IncidentOrchestrator
+from gateheal.policy import load_operator_hmac_key, mint_approval_token
 from gateheal.state import PersistentStateStore
-from gateheal.transport import SSHLabTransport, TransportUnavailableError, RecordingTransport
+from gateheal.transport import (
+    RecordingTransport,
+    SSHLabTransport,
+    TransportUnavailableError,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wp5_capture_and_verify",
-        description="Run WP5 real-lab conformance, S0-S5B smoke matrix with --repeats, and capture fixtures.",
+        description=(
+            "Run WP5 real-lab conformance, S0-S5B smoke matrix with --repeats, "
+            "and capture fixtures."
+        ),
     )
     repo_root = Path(__file__).resolve().parents[2]
-    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", str(Path.home() / ".cache" / "gateheal-vm")))
+    default_vm_dir = str(Path.home() / ".cache" / "gateheal-vm")
+    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", default_vm_dir))
     parser.add_argument(
         "--config",
         type=Path,
@@ -72,7 +83,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fixtures-out",
         type=Path,
-        default=repo_root / "tests" / "lab" / "fixtures" / "vm_captured_systemd_facts.json",
+        default=(
+            repo_root / "tests" / "lab" / "fixtures" / "vm_captured_systemd_facts.json"
+        ),
     )
     parser.add_argument(
         "--manifest-out",
@@ -84,6 +97,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.repeats < 1:
+        raise ValueError("--repeats must be >= 1")
+
     repo_root = Path(__file__).resolve().parents[2]
     cfg = load_config(args.config)
 
@@ -113,32 +129,43 @@ def main(argv: list[str] | None = None) -> int:
         verify_remote_sentinel=True,
     )
 
-    bad_root_transport = SSHLabTransport(
-        host=args.ssh_host,
-        port=args.ssh_port,
-        user="root",
-        identity_file=args.ssh_identity_file,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-    try:
-        bad_root_transport.run(("id",), timeout_sec=3.0)
+    controller_key_path = Path(args.ssh_identity_file).expanduser()
+    if not controller_key_path.is_file():
         controller_key_root_denied = False
         e6_fact = ConformanceFactResult(
             fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
             passed=False,
-            details="SECURITY FAILURE: Controller key allowed to log in as root",
+            details=f"Controller key file missing at {controller_key_path}",
         )
-    except TransportUnavailableError as exc:
-        controller_key_root_denied = exc.exit_code != 0
-        e6_fact = ConformanceFactResult(
-            fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
-            passed=controller_key_root_denied,
-            details=(
-                f"Controller key correctly rejected for root@{args.ssh_host} "
-                f"(exit_code={exc.exit_code})"
-            ),
+    else:
+        bad_root_transport = SSHLabTransport(
+            host=args.ssh_host,
+            port=args.ssh_port,
+            user="root",
+            identity_file=str(controller_key_path),
+            use_remote_timeout=True,
+            verify_remote_sentinel=True,
         )
+        try:
+            bad_root_transport.run(("true",), timeout_sec=3.0)
+            controller_key_root_denied = False
+            e6_fact = ConformanceFactResult(
+                fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+                passed=False,
+                details="SECURITY FAILURE: Controller key allowed to log in as root",
+            )
+        except TransportUnavailableError as exc:
+            controller_key_root_denied = (
+                exc.exit_code == 255 and "Permission denied" in exc.stderr_excerpt
+            )
+            e6_fact = ConformanceFactResult(
+                fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+                passed=controller_key_root_denied,
+                details=(
+                    f"exit_code={exc.exit_code}, "
+                    f"stderr={exc.stderr_excerpt.strip()[:160]}"
+                ),
+            )
 
     try:
         uname_res = transport.run(("uname", "-r"), timeout_sec=5.0)
@@ -146,7 +173,10 @@ def main(argv: list[str] | None = None) -> int:
         machine_res = transport.run(("cat", "/etc/machine-id"), timeout_sec=5.0)
     except TransportUnavailableError as exc:
         print(f"ERROR: SSH transport unavailable: {exc}", file=sys.stderr)
-        print("Troubleshooting: Refer to docs/lab-runbook.md for troubleshooting.", file=sys.stderr)
+        print(
+            "Troubleshooting: see docs/lab-runbook.md (## Troubleshooting).",
+            file=sys.stderr,
+        )
         return 2
 
     guest_kernel = uname_res.stdout_excerpt.strip() or "unknown"
@@ -176,16 +206,27 @@ def main(argv: list[str] | None = None) -> int:
             timeout_sec=45.0,
         )
     except TransportUnavailableError as exc:
-        print(f"ERROR: Harness transport unavailable during conformance: {exc}", file=sys.stderr)
+        print(
+            f"ERROR: Harness transport unavailable during conformance: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Troubleshooting: see docs/lab-runbook.md (## Troubleshooting).",
+            file=sys.stderr,
+        )
         return 2
 
-    conformance_facts = (*parse_conformance_output(conf_res.stdout_excerpt), e6_fact)
-    conformance_all_passed = bool(conformance_facts) and all(f.passed for f in conformance_facts)
+    conformance_facts = (
+        *parse_conformance_output(conf_res.stdout_excerpt),
+        e6_fact,
+    )
+    conformance_all_passed = bool(conformance_facts) and all(
+        f.passed for f in conformance_facts
+    )
 
     smoke_results: list[SmokeScenarioRunResult] = []
     captured_show_outputs: dict[str, dict[str, str]] = {}
     scenarios_probes_data: dict[str, dict[str, object]] = {}
-
     recording_transport = RecordingTransport(transport)
 
     try:
@@ -208,79 +249,118 @@ def main(argv: list[str] | None = None) -> int:
                                 "env",
                                 "GATEHEAL_INSIDE_LAB=1",
                                 "bash",
-                                f"{args.guest_repo_dir}/lab/fault_injection/inject_fault.sh",
+                                (
+                                    f"{args.guest_repo_dir}/"
+                                    "lab/fault_injection/inject_fault.sh"
+                                ),
                                 exp.fault_injection_arg,
                             ),
                             timeout_sec=10.0,
                         )
-                    if exp.scenario_id == "S5_COLLATERAL_TRAP" and exp.seed_prior_recovery_attempts == 0:
+                    if exp.scenario_id in (
+                        "S5_COLLATERAL_TRAP",
+                        "S5B_COLLATERAL_FORCED_RESTART",
+                    ):
                         _ = root_harness.run(
-                            ("systemctl", "restart", "lab-api.service", "lab-worker.service"),
+                            (
+                                "systemctl",
+                                "restart",
+                                "lab-api.service",
+                                "lab-worker.service",
+                            ),
                             timeout_sec=10.0,
                         )
 
-                    recording_transport.reset_counts()
                     _ = wait_for_expected_pre_state(
-                        recording_transport,
+                        transport,
                         exp.expected_pre_active_states,
                         timeout_sec=20.0,
                         poll_interval_sec=0.5,
                         grace_wait_sec=5.5,
                     )
 
-                    scen_captures: dict[str, str] = {}
-                    for unit_name in cfg.inventory.services:
-                        show_r = recording_transport.run(
+                    if repeat_idx == 1:
+                        scen_captures: dict[str, str] = {}
+                        for unit_name in cfg.inventory.services:
+                            show_r = transport.run(
+                                (
+                                    "systemctl",
+                                    "show",
+                                    unit_name,
+                                    (
+                                        "--property=ActiveState,SubState,Result,"
+                                        "NRestarts,CanReload,"
+                                        "ActiveEnterTimestampMonotonic,InvocationID,"
+                                        "ExecMainStartTimestampMonotonic"
+                                    ),
+                                ),
+                                timeout_sec=5.0,
+                            )
+                            scen_captures[unit_name] = show_r.stdout_excerpt
+                        captured_show_outputs[exp.scenario_id] = scen_captures
+
+                        uptime_r = transport.run(
+                            ("cat", "/proc/uptime"), timeout_sec=3.0
+                        )
+                        jnl_r = transport.run(
                             (
-                                "systemctl",
-                                "show",
-                                unit_name,
-                                "--property=ActiveState,SubState,Result,NRestarts,CanReload,"
-                                "ActiveEnterTimestampMonotonic,InvocationID,ExecMainStartTimestampMonotonic",
+                                "journalctl",
+                                "-u",
+                                "lab-api.service",
+                                "-n",
+                                "20",
+                                "--no-pager",
+                                "-o",
+                                "short-monotonic",
                             ),
                             timeout_sec=5.0,
                         )
-                        scen_captures[unit_name] = show_r.stdout_excerpt
-                    if repeat_idx == 1:
-                        captured_show_outputs[exp.scenario_id] = scen_captures
-
-                    uptime_r = recording_transport.run(("cat", "/proc/uptime"), timeout_sec=3.0)
-                    jnl_r = recording_transport.run(
-                        (
-                            "journalctl", "-u", "lab-api.service", "-n", "20",
-                            "--no-pager", "-o", "short-monotonic",
-                        ),
-                        timeout_sec=5.0,
-                    )
-                    curl_r = recording_transport.run(
-                        (
-                            "curl", "-sS", "-w", r" HTTP=%{http_code}",
-                            "http://127.0.0.1:8080/healthz",
-                        ),
-                        timeout_sec=5.0,
-                    )
-                    tcp_6379_r = recording_transport.run(
-                        (
-                            "/usr/bin/python3", "-m", "gateheal.lab_daemons",
-                            "--check-tcp", "--host", "127.0.0.1", "--port", "6379",
-                        ),
-                        timeout_sec=3.0,
-                    )
-                    tcp_8081_r = recording_transport.run(
-                        (
-                            "/usr/bin/python3", "-m", "gateheal.lab_daemons",
-                            "--check-tcp", "--host", "127.0.0.1", "--port", "8081",
-                        ),
-                        timeout_sec=3.0,
-                    )
-                    val_cfg_r = recording_transport.run(
-                        (
-                            "/usr/bin/python3", "-m", "gateheal.lab_daemons",
-                            "--validate-config", "/etc/lab-api/config.yaml",
-                        ),
-                        timeout_sec=3.0,
-                    )
-                    if repeat_idx == 1:
+                        curl_r = transport.run(
+                            (
+                                "curl",
+                                "-sS",
+                                "-w",
+                                r" HTTP=%{http_code}",
+                                "http://127.0.0.1:8080/healthz",
+                            ),
+                            timeout_sec=5.0,
+                        )
+                        tcp_6379_r = transport.run(
+                            (
+                                "/usr/bin/python3",
+                                "-m",
+                                "gateheal.lab_daemons",
+                                "--check-tcp",
+                                "--host",
+                                "127.0.0.1",
+                                "--port",
+                                "6379",
+                            ),
+                            timeout_sec=3.0,
+                        )
+                        tcp_8081_r = transport.run(
+                            (
+                                "/usr/bin/python3",
+                                "-m",
+                                "gateheal.lab_daemons",
+                                "--check-tcp",
+                                "--host",
+                                "127.0.0.1",
+                                "--port",
+                                "8081",
+                            ),
+                            timeout_sec=3.0,
+                        )
+                        val_cfg_r = transport.run(
+                            (
+                                "/usr/bin/python3",
+                                "-m",
+                                "gateheal.lab_daemons",
+                                "--validate-config",
+                                "/etc/lab-api/config.yaml",
+                            ),
+                            timeout_sec=3.0,
+                        )
                         scenarios_probes_data[exp.scenario_id] = {
                             "uptime": uptime_r.stdout_excerpt,
                             "journal_api": jnl_r.stdout_excerpt,
@@ -298,19 +378,21 @@ def main(argv: list[str] | None = None) -> int:
                         prior_recovery_attempts=exp.seed_prior_recovery_attempts,
                         action_history=exp.seed_action_history,
                     )
+
+                    hmac_k = (
+                        load_operator_hmac_key()
+                        or b"dev-operator-hmac-secret-key-32bytes-long!!"
+                    )
                     approval_token = None
                     if exp.requires_approval_token:
-                        from gateheal.policy import mint_approval_token, load_operator_hmac_key
-                        hmac_k = load_operator_hmac_key() or b"dev-operator-hmac-secret-key-32bytes-long!!"
-                        from gateheal.collector import IncidentCollector
                         collector = IncidentCollector(cfg)
                         collected_inc = collector.collect_from_transport(
                             incident_id=inc_id,
                             target_unit="lab-api.service",
-                            transport=recording_transport,
+                            transport=transport,
                         )
                         approval_token = mint_approval_token(
-                            token_id=f"tok-{repeat_idx}",
+                            token_id=f"tok-{exp.scenario_id.lower()}-{repeat_idx}",
                             incident=collected_inc,
                             config=cfg,
                             action_id=ActionId.RESTART_SERVICE.value,
@@ -319,13 +401,22 @@ def main(argv: list[str] | None = None) -> int:
                             hmac_key=hmac_k,
                         )
 
+                    recording_transport.reset_counts()
                     orchestrator = IncidentOrchestrator(
                         cfg,
                         transport=recording_transport,
-                        audit_recorder=AuditRecorder(tmp_dir / f"{inc_id}_audit.jsonl"),
-                        escalation_sink=EscalationSink(tmp_dir / f"{inc_id}_esc.jsonl"),
+                        audit_recorder=AuditRecorder(
+                            tmp_dir / f"{inc_id}_audit.jsonl"
+                        ),
+                        escalation_sink=EscalationSink(
+                            tmp_dir / f"{inc_id}_esc.jsonl"
+                        ),
                         state_store=state_store,
                     )
+                    if exp.requires_approval_token:
+                        orchestrator.policy_engine._hmac_key_loader = (
+                            lambda _k=hmac_k: _k
+                        )
 
                     t_start = time.monotonic()
                     audit = orchestrator.handle_incident(
@@ -335,8 +426,13 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     wall_sec = round(max(0.0, time.monotonic() - t_start), 3)
 
-                    if audit.selected_proposal is None or audit.verification_report is None:
-                        raise RuntimeError(f"Scenario {exp.scenario_id} produced incomplete audit.")
+                    if (
+                        audit.selected_proposal is None
+                        or audit.verification_report is None
+                    ):
+                        raise RuntimeError(
+                            f"Scenario {exp.scenario_id} produced incomplete audit."
+                        )
 
                     sel = audit.selected_proposal
                     ver = audit.verification_report
@@ -372,10 +468,23 @@ def main(argv: list[str] | None = None) -> int:
                             matched_expectation=matched,
                         )
                     )
+    except TransportUnavailableError as exc:
+        print(
+            f"ERROR: Transport unavailable during smoke execution: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Troubleshooting: see docs/lab-runbook.md (## Troubleshooting).",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
         try:
-            root_harness.run(
+            _ = root_harness.run(
                 (
-                    "env", "GATEHEAL_INSIDE_LAB=1", "bash",
+                    "env",
+                    "GATEHEAL_INSIDE_LAB=1",
+                    "bash",
                     f"{args.guest_repo_dir}/lab/reset/reset_lab.sh",
                 ),
                 timeout_sec=15.0,
@@ -383,12 +492,21 @@ def main(argv: list[str] | None = None) -> int:
         except TransportUnavailableError:
             pass
 
-    except TransportUnavailableError as exc:
-        print(f"ERROR: Transport unavailable during smoke execution: {exc}", file=sys.stderr)
-        print("Troubleshooting: Refer to docs/lab-runbook.md for troubleshooting.", file=sys.stderr)
-        return 2
+    default_vm_dir = str(Path.home() / ".cache" / "gateheal-vm")
+    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", default_vm_dir))
+    release_file = vm_dir / "base_image_release"
+    pin_file = vm_dir / "base.pin"
+    recorded_release = (
+        release_file.read_text(encoding="utf-8").strip()
+        if release_file.is_file()
+        else DEFAULT_PINNED_UBUNTU_RELEASE
+    )
+    recorded_upstream_sha: str | None = None
+    if pin_file.is_file():
+        pin_tokens = pin_file.read_text(encoding="utf-8").split()
+        if pin_tokens:
+            recorded_upstream_sha = pin_tokens[-1].strip()
 
-    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", str(Path.home() / ".cache" / "gateheal-vm")))
     manifest = build_lab_run_manifest(
         repo_root=repo_root,
         config_path=args.config,
@@ -401,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
         guest_systemd_version=guest_systemd_version,
         guest_machine_id_sha256=guest_machine_id_sha256,
         controller_key_root_login_denied=controller_key_root_denied,
+        base_image_release=recorded_release or DEFAULT_PINNED_UBUNTU_RELEASE,
+        base_image_upstream_sha256=recorded_upstream_sha,
         base_image_path=vm_dir / "ubuntu-24.04-base.qcow2",
         overlay_image_path=vm_dir / "lab-overlay.qcow2",
         repeats=args.repeats,
@@ -413,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if conformance_all_passed:
         fixture_payload = {
+            "fixture_version": 2,
             "capture_source": "LIVE_QEMU_KVM_GUEST",
             "capture_id": uuid.uuid4().hex,
             "captured_at_utc": manifest.generated_at_utc,
@@ -424,7 +545,9 @@ def main(argv: list[str] | None = None) -> int:
             "scenarios_probes": scenarios_probes_data,
         }
         args.fixtures_out.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_fix_path = tempfile.mkstemp(dir=str(args.fixtures_out.parent), text=True)
+        fd, tmp_fix_path = tempfile.mkstemp(
+            dir=str(args.fixtures_out.parent), text=True
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as tf:
                 json.dump(fixture_payload, tf, indent=2)
@@ -445,5 +568,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except TransportUnavailableError as exc:
-        print(f"ERROR: SSH to {exc} failed. Troubleshooting: see docs/lab-runbook.md.", file=sys.stderr)
+        print(
+            f"ERROR: SSH failed ({exc}). Troubleshooting: see docs/lab-runbook.md.",
+            file=sys.stderr,
+        )
         sys.exit(2)
