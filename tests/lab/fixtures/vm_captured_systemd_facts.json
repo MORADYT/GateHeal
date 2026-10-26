@@ -1,0 +1,211 @@
+{
+  "fixture_version": 2,
+  "capture_source": "LIVE_QEMU_KVM_GUEST",
+  "capture_id": "8f30e92dcd4d45c19c6f9e26bb9b6512",
+  "captured_at_utc": "2026-10-26T06:57:35.605376+00:00",
+  "guest_kernel": "6.8.0-147-generic",
+  "guest_systemd_version": "systemd 255 (255.4-1ubuntu8.18)",
+  "guest_machine_id_sha256": "ef7123befdec520f02202a1b259e465d51c7d7a6ac8e19eb107667d4c4319073",
+  "conformance_facts": [
+    {
+      "fact_id": "FACT_4A_ACTIVE_API_RESTART_KILLS_WORKER",
+      "passed": true,
+      "details": "worker_pre=active, worker_post=failed"
+    },
+    {
+      "fact_id": "FACT_5B_MANUAL_RESTART_NRESTARTS",
+      "passed": true,
+      "details": "before=1 after=0 observed=reset"
+    },
+    {
+      "fact_id": "SUDO_POS_RELOAD_API",
+      "passed": true,
+      "details": "sudo -n /usr/bin/systemctl reload lab-api.service allowed and unit active"
+    },
+    {
+      "fact_id": "SUDO_POS_RESTART_REDIS",
+      "passed": true,
+      "details": "sudo -n /usr/bin/systemctl restart lab-redis.service allowed and unit active"
+    },
+    {
+      "fact_id": "SUDO_POS_RESTART_API",
+      "passed": true,
+      "details": "sudo -n /usr/bin/systemctl restart lab-api.service allowed and unit active"
+    },
+    {
+      "fact_id": "SUDO_POS_RESTART_WORKER",
+      "passed": true,
+      "details": "sudo -n /usr/bin/systemctl restart lab-worker.service allowed and unit active"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl stop lab-api.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl reload lab-redis.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl reload lab-worker.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl restart ssh.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl daemon-reload"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /bin/sh -c id"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl restart lab-api.service --no-block"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl restart lab-api.service lab-redis.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl --no-block restart lab-api.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl restart 'lab-*.service'"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl kill lab-api.service"
+    },
+    {
+      "fact_id": "SUDO_NEG_DENIED",
+      "passed": true,
+      "details": "Correctly denied: sudo -n /usr/bin/systemctl start lab-api.service"
+    },
+    {
+      "fact_id": "FACT_6_UBUNTU_UNPRIVILEGED_READS",
+      "passed": true,
+      "details": "ubuntu unprivileged reads succeed for lab-api.service"
+    },
+    {
+      "fact_id": "FACT_7_EXECSTARTPRE_FAILURE",
+      "passed": true,
+      "details": "ActiveState=failed, Result=exit-code, worker=active"
+    },
+    {
+      "fact_id": "SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+      "passed": true,
+      "details": "exit_code=255, stderr=root@127.0.0.1: Permission denied (publickey)."
+    }
+  ],
+  "scenarios_systemctl_show": {
+    "S0_HEALTHY_CONTROL": {
+      "lab-redis.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=175627046\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=175627159\nCanReload=no\nInvocationID=638520855573420db27dce241808b049\n",
+      "lab-api.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=175703047\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=175703081\nCanReload=yes\nInvocationID=cbcd0efbeff648e5884e68dda25f0297\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=175711035\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=175711170\nCanReload=no\nInvocationID=420c991c58714cbe841aeccf2cda0654\n"
+    },
+    "S1_SERVICE_CRASH": {
+      "lab-redis.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=208535045\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=208535160\nCanReload=no\nInvocationID=1cbe11bd91b9479083561be40b4419cc\n",
+      "lab-api.service": "Result=signal\nNRestarts=0\nExecMainStartTimestampMonotonic=208606041\nActiveState=failed\nSubState=failed\nActiveEnterTimestampMonotonic=208606078\nCanReload=yes\nInvocationID=834fa25eb12041edb60b1786b7418804\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=208614077\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=208614204\nCanReload=no\nInvocationID=8f3524d96c30498781917b5b50a95290\n"
+    },
+    "S2_INVALID_CONFIG": {
+      "lab-redis.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=269570080\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=269570200\nCanReload=no\nInvocationID=dc7706bb903a4da5ba3c189817bc6352\n",
+      "lab-api.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=269644067\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=269644104\nCanReload=yes\nInvocationID=262dedd838064f958c712bb2115128b2\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=269663051\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=269663272\nCanReload=no\nInvocationID=efcbe73f9944434fbc593d69e594b2a8\n"
+    },
+    "S3_DEPENDENCY_FAILURE": {
+      "lab-redis.service": "Result=signal\nNRestarts=0\nExecMainStartTimestampMonotonic=302889051\nActiveState=failed\nSubState=failed\nActiveEnterTimestampMonotonic=302889188\nCanReload=no\nInvocationID=1942e8dd5ead4ac0a71265d569b16ca4\n",
+      "lab-api.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=302967045\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=302967076\nCanReload=yes\nInvocationID=9214afa79d6f4858bb67dc305fb7382c\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=302979108\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=302981101\nCanReload=no\nInvocationID=13b06897a3a847fe8dff875a570c2018\n"
+    },
+    "S4_PERSISTENT_FAILURE": {
+      "lab-redis.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=363605110\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=363605235\nCanReload=no\nInvocationID=d2724c356f3c4a6790999d6b4b27c4a3\n",
+      "lab-api.service": "Result=signal\nNRestarts=0\nExecMainStartTimestampMonotonic=363691075\nActiveState=failed\nSubState=failed\nActiveEnterTimestampMonotonic=363691110\nCanReload=yes\nInvocationID=47b8ac3ee8734a63abdce399adcad67e\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=363706118\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=363708101\nCanReload=no\nInvocationID=54dd3911e7ce44e4aad508c3884a2dc5\n"
+    },
+    "S5_COLLATERAL_TRAP": {
+      "lab-redis.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=395895126\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=395895281\nCanReload=no\nInvocationID=69fa7d1ab96e43ceaa4be0ca8793c3e0\n",
+      "lab-api.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=396362038\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=396362076\nCanReload=yes\nInvocationID=1138f79362c0433881e63ab09086b678\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=396364068\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=396365790\nCanReload=no\nInvocationID=e6090d7137cc449389cebab5896e4926\n"
+    },
+    "S5B_COLLATERAL_FORCED_RESTART": {
+      "lab-redis.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=459024076\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=459024215\nCanReload=no\nInvocationID=945affd81a14434bba246c9bf220a812\n",
+      "lab-api.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=459476065\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=459476099\nCanReload=yes\nInvocationID=401b0cb33a304f3db67e0912e216ee4d\n",
+      "lab-worker.service": "Result=success\nNRestarts=0\nExecMainStartTimestampMonotonic=459479065\nActiveState=active\nSubState=running\nActiveEnterTimestampMonotonic=459480174\nCanReload=no\nInvocationID=b0e3c13df721414488be578ce45cf5f5\n"
+    }
+  },
+  "scenarios_probes": {
+    "S0_HEALTHY_CONTROL": {
+      "uptime": "182.15 312.90\n",
+      "journal_api": "[  175.311539] gateheal-lab python3[18234]: YAML syntax error: while parsing a flow sequence\n[  175.311539] gateheal-lab python3[18234]:   in \"<unicode string>\", line 1, column 15:\n[  175.311539] gateheal-lab python3[18234]:     invalid_yaml: [unclosed\n[  175.311539] gateheal-lab python3[18234]:                   ^\n[  175.311539] gateheal-lab python3[18234]: expected ',' or ']', but got '<stream end>'\n[  175.311539] gateheal-lab python3[18234]:   in \"<unicode string>\", line 2, column 1:\n[  175.311539] gateheal-lab python3[18234]:     \n[  175.311897] gateheal-lab python3[18234]:     ^\n[  175.319625] gateheal-lab systemd[1]: lab-api.service: Control process exited, code=exited, status=65/DATAERR\n[  175.320240] gateheal-lab systemd[1]: lab-api.service: Failed with result 'exit-code'.\n[  175.320276] gateheal-lab systemd[1]: Failed to start lab-api.service - GateHeal Isolated Lab API Service.\n[  175.380461] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  175.429061] gateheal-lab python3[18257]: Configuration valid.\n[  175.443973] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  175.604824] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  175.613060] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  175.613191] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  175.642360] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  175.691176] gateheal-lab python3[18332]: Configuration valid.\n[  175.706245] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n",
+      "curl_healthz": "{\"status\": \"ok\", \"reload_count\": 0, \"boot_id\": \"48f3a66a3b0547f3a1503336d34a96c4\"} HTTP=200",
+      "tcp_6379_exit": 0,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 0
+    },
+    "S1_SERVICE_CRASH": {
+      "uptime": "215.18 368.74\n",
+      "journal_api": "[  187.430752] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  187.430951] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  187.471244] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  187.529400] gateheal-lab python3[20602]: Configuration valid.\n[  187.542090] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  197.987306] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  197.994365] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  197.994575] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  198.026233] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  198.075242] gateheal-lab python3[22395]: Configuration valid.\n[  198.089059] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  208.515442] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  208.521361] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  208.521713] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  208.543289] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  208.594495] gateheal-lab python3[24188]: Configuration valid.\n[  208.608055] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  208.770880] gateheal-lab systemd[1]: lab-api.service: Sent signal SIGKILL to main process 24190 (python3) on client request.\n[  208.771227] gateheal-lab systemd[1]: lab-api.service: Main process exited, code=killed, status=9/KILL\n[  208.771265] gateheal-lab systemd[1]: lab-api.service: Failed with result 'signal'.\n",
+      "curl_healthz": " HTTP=000",
+      "tcp_6379_exit": 0,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 0
+    },
+    "S2_INVALID_CONFIG": {
+      "uptime": "276.22 472.58\n",
+      "journal_api": "[  239.126777] gateheal-lab python3[29304]: Configuration valid.\n[  239.142236] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  249.660277] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  249.669070] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  249.669236] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  249.697296] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  249.755032] gateheal-lab python3[31254]: Configuration valid.\n[  249.765109] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  249.933954] gateheal-lab systemd[1]: lab-api.service: Sent signal SIGKILL to main process 31256 (python3) on client request.\n[  249.934921] gateheal-lab systemd[1]: lab-api.service: Main process exited, code=killed, status=9/KILL\n[  249.935200] gateheal-lab systemd[1]: lab-api.service: Failed with result 'signal'.\n[  258.866390] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  258.912406] gateheal-lab python3[32594]: Configuration valid.\n[  258.928246] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  269.548255] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  269.556510] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  269.556625] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  269.575466] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  269.629281] gateheal-lab python3[34544]: Configuration valid.\n[  269.644233] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n",
+      "curl_healthz": "{\"status\": \"ok\", \"reload_count\": 0, \"boot_id\": \"71e1ae195e194bbf8c8c243928add806\"} HTTP=200",
+      "tcp_6379_exit": 0,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 65
+    },
+    "S3_DEPENDENCY_FAILURE": {
+      "uptime": "309.53 528.65\n",
+      "journal_api": "[  269.629281] gateheal-lab python3[34544]: Configuration valid.\n[  269.644233] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  281.693655] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  281.701747] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  281.701883] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  281.728526] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  281.778057] gateheal-lab python3[36883]: Configuration valid.\n[  281.794190] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  292.266101] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  292.274482] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  292.274594] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  292.299783] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  292.350315] gateheal-lab python3[38736]: Configuration valid.\n[  292.362120] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  302.865302] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  302.873152] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  302.873286] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  302.909180] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  302.956228] gateheal-lab python3[40593]: Configuration valid.\n[  302.969047] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n",
+      "curl_healthz": "{\"status\": \"unhealthy\", \"reason\": \"ERROR: Redis connection refused on 127.0.0.1:6379\", \"reload_count\": 0, \"boot_id\": \"5daec558f61b42cb87af3d424059b66a\"} HTTP=503",
+      "tcp_6379_exit": 1,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 0
+    },
+    "S4_PERSISTENT_FAILURE": {
+      "uptime": "370.29 632.07\n",
+      "journal_api": "[  323.850383] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  323.850489] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  323.872321] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  323.924227] gateheal-lab python3[44358]: Configuration valid.\n[  323.936300] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  343.642072] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  343.649284] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  343.649426] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  343.668350] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  343.727603] gateheal-lab python3[47655]: Configuration valid.\n[  343.743608] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  363.585200] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  363.593116] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  363.593257] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  363.622127] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  363.674037] gateheal-lab python3[50943]: Configuration valid.\n[  363.693062] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  363.864298] gateheal-lab systemd[1]: lab-api.service: Sent signal SIGKILL to main process 50945 (python3) on client request.\n[  363.865661] gateheal-lab systemd[1]: lab-api.service: Main process exited, code=killed, status=9/KILL\n[  363.865720] gateheal-lab systemd[1]: lab-api.service: Failed with result 'signal'.\n",
+      "curl_healthz": " HTTP=000",
+      "tcp_6379_exit": 0,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 65
+    },
+    "S5_COLLATERAL_TRAP": {
+      "uptime": "403.02 686.97\n",
+      "journal_api": "[  375.462887] gateheal-lab python3[53119]: Configuration valid.\n[  375.481054] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  375.647846] gateheal-lab systemd[1]: lab-api.service: Sent signal SIGKILL to main process 53121 (python3) on client request.\n[  375.648742] gateheal-lab systemd[1]: lab-api.service: Main process exited, code=killed, status=9/KILL\n[  375.648806] gateheal-lab systemd[1]: lab-api.service: Failed with result 'signal'.\n[  385.658973] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  385.712241] gateheal-lab python3[54792]: Configuration valid.\n[  385.726070] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  385.894949] gateheal-lab systemd[1]: lab-api.service: Sent signal SIGKILL to main process 54794 (python3) on client request.\n[  385.897184] gateheal-lab systemd[1]: lab-api.service: Main process exited, code=killed, status=9/KILL\n[  385.897277] gateheal-lab systemd[1]: lab-api.service: Failed with result 'signal'.\n[  395.904359] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  395.966147] gateheal-lab python3[56465]: Configuration valid.\n[  395.978143] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  396.283756] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  396.295535] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  396.295659] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  396.300326] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  396.350113] gateheal-lab python3[56585]: Configuration valid.\n[  396.364072] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n",
+      "curl_healthz": "{\"status\": \"degraded\", \"reason\": \"WARN: worker pool stale; send SIGHUP to reload\", \"reload_count\": 0, \"boot_id\": \"08d26c9c6ea242e79056c00c17740405\"} HTTP=503",
+      "tcp_6379_exit": 0,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 0
+    },
+    "S5B_COLLATERAL_FORCED_RESTART": {
+      "uptime": "466.14 792.92\n",
+      "journal_api": "[  438.887661] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  438.897716] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  438.897831] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  438.903353] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  438.954599] gateheal-lab python3[63977]: Configuration valid.\n[  438.966249] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  448.296585] gateheal-lab systemd[1]: Reloading lab-api.service - GateHeal Isolated Lab API Service...\n[  448.296676] gateheal-lab systemd[1]: Reloaded lab-api.service - GateHeal Isolated Lab API Service.\n[  458.997743] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  459.006846] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  459.006965] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  459.035022] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  459.087987] gateheal-lab python3[67309]: Configuration valid.\n[  459.102061] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n[  459.394489] gateheal-lab systemd[1]: Stopping lab-api.service - GateHeal Isolated Lab API Service...\n[  459.404148] gateheal-lab systemd[1]: lab-api.service: Deactivated successfully.\n[  459.404291] gateheal-lab systemd[1]: Stopped lab-api.service - GateHeal Isolated Lab API Service.\n[  459.415056] gateheal-lab systemd[1]: Starting lab-api.service - GateHeal Isolated Lab API Service...\n[  459.464039] gateheal-lab python3[67429]: Configuration valid.\n[  459.478086] gateheal-lab systemd[1]: Started lab-api.service - GateHeal Isolated Lab API Service.\n",
+      "curl_healthz": "{\"status\": \"degraded\", \"reason\": \"WARN: worker pool stale; send SIGHUP to reload\", \"reload_count\": 0, \"boot_id\": \"e76dc458a0f0444495884e109ac31dae\"} HTTP=503",
+      "tcp_6379_exit": 0,
+      "tcp_8081_exit": 0,
+      "validate_config_exit": 0
+    }
+  }
+}
