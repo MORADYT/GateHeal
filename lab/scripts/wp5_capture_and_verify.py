@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -23,7 +24,9 @@ from gateheal.lab_bringup import (
     SmokeScenarioRunResult,
     build_lab_run_manifest,
     build_wp5_smoke_expectations,
+    conformance_is_complete_and_passed,
     measure_transport_latency,
+    missing_conformance_fact_ids,
     parse_conformance_output,
     wait_for_expected_pre_state,
 )
@@ -135,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         identity_file=args.harness_identity_file,
         use_remote_timeout=True,
         verify_remote_sentinel=True,
+        max_output_chars=262144,
     )
 
     controller_key_path = Path(args.ssh_identity_file).expanduser()
@@ -228,9 +232,15 @@ def main(argv: list[str] | None = None) -> int:
         *parse_conformance_output(conf_res.stdout_excerpt),
         e6_fact,
     )
-    conformance_all_passed = bool(conformance_facts) and all(
-        f.passed for f in conformance_facts
-    )
+    missing_facts = missing_conformance_fact_ids(conformance_facts)
+    if missing_facts:
+        print(
+            "ERROR: conformance output is incomplete (truncated or script failed early); "
+            f"missing fact ids: {', '.join(missing_facts)}",
+            file=sys.stderr,
+        )
+        return 3
+    conformance_all_passed = conformance_is_complete_and_passed(conformance_facts)
 
     smoke_results: list[SmokeScenarioRunResult] = []
     captured_show_outputs: dict[str, dict[str, str]] = {}
@@ -238,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
     recording_transport = RecordingTransport(transport)
 
     try:
+        runs_dir = args.manifest_out.parent / "wp5_runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory() as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
             for exp in build_wp5_smoke_expectations():
@@ -265,20 +277,6 @@ def main(argv: list[str] | None = None) -> int:
                             ),
                             timeout_sec=10.0,
                         )
-                    if exp.scenario_id in (
-                        "S5_COLLATERAL_TRAP",
-                        "S5B_COLLATERAL_FORCED_RESTART",
-                    ):
-                        _ = root_harness.run(
-                            (
-                                "systemctl",
-                                "restart",
-                                "lab-api.service",
-                                "lab-worker.service",
-                            ),
-                            timeout_sec=10.0,
-                        )
-
                     _ = wait_for_expected_pre_state(
                         transport,
                         exp.expected_pre_active_states,
@@ -286,6 +284,18 @@ def main(argv: list[str] | None = None) -> int:
                         poll_interval_sec=0.5,
                         grace_wait_sec=5.5,
                     )
+
+                    if exp.fault_injection_arg == "S5_COLLATERAL_TRAP":
+                        health_r = transport.run(
+                            ("curl", "-sS", "http://127.0.0.1:8080/healthz"),
+                            timeout_sec=5.0,
+                        )
+                        if "degraded" not in health_r.stdout_excerpt:
+                            raise RuntimeError(
+                                f"{exp.scenario_id}: precondition not established; "
+                                "lab-api is not degraded after fault injection "
+                                f"(healthz={health_r.stdout_excerpt.strip()[:160]!r})."
+                            )
 
                     if repeat_idx == 1:
                         scen_captures: dict[str, str] = {}
@@ -443,6 +453,10 @@ def main(argv: list[str] | None = None) -> int:
 
                     sel = audit.selected_proposal
                     ver = audit.verification_report
+                    for suffix in ("audit", "esc"):
+                        src_file = tmp_dir / f"{inc_id}_{suffix}.jsonl"
+                        if src_file.is_file():
+                            shutil.copy2(src_file, runs_dir / src_file.name)
                     mut_exec = recording_transport.mutating_commands_executed
                     total_cmds = recording_transport.ssh_command_count
 
@@ -473,8 +487,19 @@ def main(argv: list[str] | None = None) -> int:
                             mutating_commands_executed=mut_exec,
                             escalated=audit.escalated,
                             matched_expectation=matched,
+                            verification_details=ver.details[:500],
                         )
                     )
+                    if not matched:
+                        print(
+                            f"MISMATCH {exp.scenario_id} r{repeat_idx}: "
+                            f"fault={audit.diagnosis.fault_class.value} "
+                            f"action={sel.action_id} status={ver.status.value} "
+                            f"collateral={list(ver.collateral_failures)} "
+                            f"escalated={audit.escalated} mutating={mut_exec} "
+                            f"details={ver.details[:300]!r}",
+                            file=sys.stderr,
+                        )
     except TransportUnavailableError as exc:
         print(
             f"ERROR: Transport unavailable during smoke execution: {exc}",
@@ -538,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
     )
 
-    if conformance_all_passed:
+    if conformance_all_passed and manifest.smoke_all_passed:
         fixture_payload = {
             "fixture_version": 2,
             "capture_source": "LIVE_QEMU_KVM_GUEST",

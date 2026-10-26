@@ -8,6 +8,7 @@ to execute mutating `sudo -n /usr/bin/systemctl reload|restart <unit>` actions.
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import os
 import platform
@@ -385,6 +386,7 @@ class SSHLabTransport:
         use_systemd_scope: bool = False,
         use_remote_timeout: bool = False,
         verify_remote_sentinel: bool = True,
+        max_output_chars: int = 2048,
         runner: Callable[[Sequence[str], float], TransportResult] | None = None,
         _runner: Callable[[Sequence[str], float], TransportResult] | None = None,
     ) -> None:
@@ -404,7 +406,11 @@ class SSHLabTransport:
         self._sentinel_verified = False
         chosen_runner = _runner if _runner is not None else runner
         self._runner: Callable[[Sequence[str], float], TransportResult] = (
-            run_isolated_process_group if chosen_runner is None else chosen_runner
+            functools.partial(
+                run_isolated_process_group, max_output_chars=max_output_chars
+            )
+            if chosen_runner is None
+            else chosen_runner
         )
 
     @property

@@ -149,6 +149,10 @@ class LabApiRuntimeState:
             self.worker_pool_stale = bool(raw["worker_pool_stale"])
         return True
 
+    def mark_worker_pool_stale(self) -> None:
+        """Mark the worker pool stale at runtime (fault injection; cleared by SIGHUP or restart)."""
+        self.worker_pool_stale = True
+
     def on_sigterm_hard_restart(self) -> bool:
         """Notify coupled lab-worker when active lab-api receives SIGTERM (hard restart)."""
         return notify_worker_of_api_hard_restart(
@@ -235,12 +239,17 @@ def run_api_daemon(config_path: Path) -> int:
         _ = (signum, frame)
         state.load_or_reload(is_sighup=True)
 
+    def _handle_sigusr1(signum: int, frame: FrameType | None) -> None:
+        _ = (signum, frame)
+        state.mark_worker_pool_stale()
+
     def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
         _ = (signum, frame)
         state.on_sigterm_hard_restart()
         sys.exit(0)
 
     signal.signal(signal.SIGHUP, _handle_sighup)
+    signal.signal(signal.SIGUSR1, _handle_sigusr1)
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
     class HealthHandler(BaseHTTPRequestHandler):

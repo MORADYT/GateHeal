@@ -68,6 +68,43 @@ class SmokeMatrixExpectation(BaseModel):
     expected_mutating_commands: int = 1
 
 
+REQUIRED_CONFORMANCE_FACT_IDS: tuple[str, ...] = (
+    "FACT_1_RESTART_NO_NRESTARTS_ZERO",
+    "FACT_2_INVOCATION_ID_RESTART_VS_RELOAD",
+    "FACT_3_SIGKILL_RESULT_SIGNAL",
+    "FACT_4A_ACTIVE_API_RESTART_KILLS_WORKER",
+    "FACT_4B_START_FAILED_API_PRESERVES_WORKER",
+    "FACT_5B_MANUAL_RESTART_NRESTARTS",
+    "SUDO_POS_RELOAD_API",
+    "SUDO_POS_RESTART_REDIS",
+    "SUDO_POS_RESTART_API",
+    "SUDO_POS_RESTART_WORKER",
+    "SUDO_NEG_DENIED",
+    "FACT_6_UBUNTU_UNPRIVILEGED_READS",
+    "FACT_7_EXECSTARTPRE_FAILURE",
+    "SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+)
+
+
+def missing_conformance_fact_ids(
+    facts: Sequence[ConformanceFactResult],
+) -> tuple[str, ...]:
+    """Return required fact ids that are absent from facts (e.g. truncated output)."""
+    seen = {f.fact_id for f in facts}
+    return tuple(i for i in REQUIRED_CONFORMANCE_FACT_IDS if i not in seen)
+
+
+def conformance_is_complete_and_passed(
+    facts: Sequence[ConformanceFactResult],
+) -> bool:
+    """True only if every required fact is present AND every reported fact passed."""
+    return (
+        bool(facts)
+        and not missing_conformance_fact_ids(facts)
+        and all(f.passed for f in facts)
+    )
+
+
 class SmokeScenarioRunResult(BaseModel):
     """Recorded live execution result for a single S0-S5B smoke scenario run."""
 
@@ -87,6 +124,7 @@ class SmokeScenarioRunResult(BaseModel):
     mutating_commands_executed: int = 0
     escalated: bool
     matched_expectation: bool
+    verification_details: str = ""
 
 
 class LabRunManifest(BaseModel):
@@ -114,6 +152,7 @@ class LabRunManifest(BaseModel):
     conformance_facts: tuple[ConformanceFactResult, ...]
     conformance_all_passed: bool
     repeats: int = 1
+    mismatch_count: int = 0
     flake_count: int = 0
     soak_budget_ok: bool = True
     smoke_matrix: tuple[SmokeScenarioRunResult, ...]
@@ -435,7 +474,18 @@ def build_lab_run_manifest(
     )
     facts_tuple = tuple(conformance_facts)
     smoke_tuple = tuple(smoke_matrix)
-    flake_count = sum(1 for s in smoke_tuple if not s.matched_expectation)
+    mismatch_count = sum(1 for s in smoke_tuple if not s.matched_expectation)
+    outcomes_by_scenario: dict[str, set[tuple[str, str, bool, tuple[str, ...]]]] = {}
+    for s in smoke_tuple:
+        outcomes_by_scenario.setdefault(s.scenario_id, set()).add(
+            (
+                s.selected_action_id,
+                s.verification_status.value,
+                s.escalated,
+                s.collateral_failures,
+            )
+        )
+    flake_count = sum(1 for v in outcomes_by_scenario.values() if len(v) > 1)
     all_soak_budget_ok = bool(smoke_tuple) and all(
         s.soak_budget_ok for s in smoke_tuple
     )
@@ -462,13 +512,14 @@ def build_lab_run_manifest(
         ssh_latency=ssh_latency,
         ssh_latency_multiplexed=ssh_latency_multiplexed,
         conformance_facts=facts_tuple,
-        conformance_all_passed=bool(facts_tuple)
-        and all(f.passed for f in facts_tuple),
+        conformance_all_passed=conformance_is_complete_and_passed(facts_tuple),
         repeats=repeats,
+        mismatch_count=mismatch_count,
         flake_count=flake_count,
         soak_budget_ok=all_soak_budget_ok,
         smoke_matrix=smoke_tuple,
         smoke_all_passed=bool(smoke_tuple)
+        and mismatch_count == 0
         and flake_count == 0
         and all_soak_budget_ok,
     )

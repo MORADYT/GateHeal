@@ -19,6 +19,7 @@ from gateheal.collector import (
 from gateheal.config import GateHealConfig, load_config
 from gateheal.controller import AuditRecorder, EscalationSink, default_artifacts_dir
 from gateheal.lab_bringup import (
+    REQUIRED_CONFORMANCE_FACT_IDS,
     LabRunManifest,
     SmokeScenarioRunResult,
     build_lab_run_manifest,
@@ -418,7 +419,7 @@ def test_wp5_latency_profiler_and_manifest_builder_with_captured_fixtures(
         sudoers_path=repo_root / "lab" / "systemd" / "gateheal-sudoers.conf",
         ssh_latency=latency,
         conformance_facts=parse_conformance_output(
-            "PASS: FACT_1_RESTART_NO_NRESTARTS_ZERO :: ok\n"
+            "".join(f"PASS: {i} :: ok\n" for i in REQUIRED_CONFORMANCE_FACT_IDS)
         ),
         smoke_matrix=smoke_runs,
         clock_utc=lambda: now_dt,
