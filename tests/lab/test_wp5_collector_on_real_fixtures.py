@@ -51,7 +51,7 @@ class _FixtureCommandTransport:
                 ),
             )
         if cmd[:2] == ("systemctl", "show"):
-            u = cmd[2]
+            u = str(cmd[2])
             return TransportResult(
                 exit_code=0,
                 duration_sec=0.01,
@@ -81,7 +81,7 @@ class _FixtureCommandTransport:
             )
         if cmd[0] == "journalctl":
             unit_idx = cmd.index("-u") + 1 if "-u" in cmd else -1
-            unit = cmd[unit_idx] if 0 < unit_idx < len(cmd) else ""
+            unit = str(cmd[unit_idx]) if 0 < unit_idx < len(cmd) else ""
             jnl_out = (
                 str(self._probes.get("journal_api", ""))
                 if unit == "lab-api.service"

@@ -10,6 +10,7 @@ GOLDEN_IMAGE="${GATEHEAL_GOLDEN_IMAGE:-${VM_DIR}/ubuntu-24.04-golden.qcow2}"
 OVERLAY_IMAGE="${GATEHEAL_OVERLAY_IMAGE:-${VM_DIR}/lab-overlay.qcow2}"
 SEED_ISO="${VM_DIR}/seed.iso"
 SEED_HASH_FILE="${VM_DIR}/seed.hash"
+BOOTED_SEED_HASH_FILE="${VM_DIR}/booted_seed.hash"
 SSH_KEY="${GATEHEAL_LAB_SSH_KEY:-${VM_DIR}/id_ed25519}"
 HARNESS_KEY="${GATEHEAL_LAB_HARNESS_KEY:-${VM_DIR}/id_harness_ed25519}"
 KNOWN_HOSTS_FILE="${GATEHEAL_LAB_KNOWN_HOSTS:-${VM_DIR}/known_hosts}"
@@ -20,8 +21,8 @@ PIN_FILE="${VM_DIR}/base.pin"
 RELEASE_FILE="${VM_DIR}/base_image_release"
 GUEST_REPO_DIR="${GATEHEAL_GUEST_REPO_DIR:-/opt/gateheal}"
 
-BASE_image_release="${GATEHEAL_CLOUD_RELEASE:-current}"
-CLOUD_RELEASE_URL="https://cloud-images.ubuntu.com/releases/noble/${BASE_image_release}"
+BASE_IMAGE_RELEASE="${GATEHEAL_CLOUD_RELEASE:-release-20250219}"
+CLOUD_RELEASE_URL="https://cloud-images.ubuntu.com/releases/noble/${BASE_IMAGE_RELEASE}"
 CLOUD_IMG_NAME="noble-server-cloudimg-amd64.img"
 
 mkdir -p "$VM_DIR"
@@ -55,6 +56,10 @@ check_seed_iso() {
     ctrl_pub="$(cat "${SSH_KEY}.pub")"
     harness_pub="$(cat "${HARNESS_KEY}.pub")"
 
+    local current_hash
+    current_hash="$(sha256sum <(echo "$ctrl_pub") <(echo "$harness_pub") | awk '{print $1}')"
+    local instance_id_suffix="${current_hash:0:12}"
+
     cat <<YAML > "$ud"
 #cloud-config
 hostname: gateheal-lab
@@ -76,12 +81,10 @@ package_update: false
 YAML
 
     cat <<YAML > "$md"
-instance-id: gateheal-lab-01
+instance-id: gateheal-lab-${instance_id_suffix}
 local-hostname: gateheal-lab
 YAML
 
-    local current_hash
-    current_hash="$(sha256sum "$ud" "${SSH_KEY}.pub" "${HARNESS_KEY}.pub" | sha256sum | awk '{print $1}')"
     if [[ ! -f "$SEED_ISO" || ! -f "$SEED_HASH_FILE" || "$(cat "$SEED_HASH_FILE")" != "$current_hash" ]]; then
         if command -v cloud-localds >/dev/null 2>&1; then
             cloud-localds "$SEED_ISO" "$ud" "$md"
@@ -107,9 +110,9 @@ YAML
 case "$ACTION" in
     bootstrap-base)
         ensure_keys
-        echo "$BASE_image_release" > "$RELEASE_FILE"
+        echo "$BASE_IMAGE_RELEASE" > "$RELEASE_FILE"
         if [[ ! -f "$BASE_IMAGE" ]]; then
-            echo "Downloading Ubuntu 24.04 (${BASE_image_release}) cloud image and SHA256SUMS ..."
+            echo "Downloading Ubuntu 24.04 (${BASE_IMAGE_RELEASE}) cloud image and SHA256SUMS ..."
             curl -fsSL "${CLOUD_RELEASE_URL}/SHA256SUMS" -o "$SHA256SUMS_FILE"
             curl -fL "${CLOUD_RELEASE_URL}/${CLOUD_IMG_NAME}" -o "${VM_DIR}/${CLOUD_IMG_NAME}"
             (
@@ -132,7 +135,7 @@ case "$ACTION" in
             fi
         fi
         check_seed_iso
-        echo "BOOTSTRAP_OK: Release=${BASE_image_release}, Base=${BASE_IMAGE}, ControllerKey=${SSH_KEY}, HarnessKey=${HARNESS_KEY}"
+        echo "BOOTSTRAP_OK: Release=${BASE_IMAGE_RELEASE}, Base=${BASE_IMAGE}, ControllerKey=${SSH_KEY}, HarnessKey=${HARNESS_KEY}"
         ;;
     create-overlay|reset-overlay)
         if [[ -f "$GOLDEN_IMAGE" ]]; then
@@ -145,20 +148,31 @@ case "$ACTION" in
             echo "FATAL: Base image not found at $BASE_IMAGE. Run '$0 bootstrap-base' first." >&2
             exit 1
         fi
-        rm -f "$OVERLAY_IMAGE" "$KNOWN_HOSTS_FILE"
+        rm -f "$OVERLAY_IMAGE" "$KNOWN_HOSTS_FILE" "$BOOTED_SEED_HASH_FILE"
         qemu-img create -f qcow2 -b "$(realpath "$BACKING")" -F qcow2 "$OVERLAY_IMAGE" >/dev/null
-        echo "OVERLAY_OK: $OVERLAY_IMAGE -> $BACKING (cleared $KNOWN_HOSTS_FILE)"
+        echo "OVERLAY_OK: $OVERLAY_IMAGE -> $BACKING (cleared $KNOWN_HOSTS_FILE and booted seed hash)"
         ;;
     sync-repo)
         ensure_keys
         mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
-        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
+        echo "Syncing repository to ubuntu@127.0.0.1:${SSH_PORT}:${GUEST_REPO_DIR} ..."
+        
+        root_ok=false
+        ubuntu_ok=false
+        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true"; then
+            root_ok=true
             ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
                 "mkdir -p ${GUEST_REPO_DIR} && chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
-        elif ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "sudo -n true" >/dev/null 2>&1; then
+        elif ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "sudo -n true"; then
+            ubuntu_ok=true
             ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
                 "sudo -n mkdir -p ${GUEST_REPO_DIR} && sudo -n chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
+        else
+            echo "FATAL: sync-repo failed. Neither root@127.0.0.1 with harness key nor ubuntu@127.0.0.1 with sudo succeeded." >&2
+            echo "Troubleshooting: See docs/lab-runbook.md (## Troubleshooting)." >&2
+            exit 2
         fi
+
         rsync -az --delete \
             --exclude '.git' \
             --exclude 'artifacts' \
@@ -176,22 +190,40 @@ case "$ACTION" in
             -o LogLevel=ERROR \
             -o IdentitiesOnly=yes \
             -i "$SSH_KEY" \
-            "${HARNESS_KEY}.pub" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/.harness_key.pub" >/dev/null
+            "${HARNESS_KEY}.pub" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/.harness_key.pub"
+
         echo "SYNC_OK: Synced repo and harness public key to ubuntu@127.0.0.1:${GUEST_REPO_DIR}"
         ;;
     provision)
         ensure_keys
         "$0" sync-repo
-        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
+        echo "Provisioning guest as root..."
+        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true"; then
             ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
                 "bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
-        else
+        elif ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "sudo -n true"; then
             ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
                 "sudo -n bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
+        else
+            echo "FATAL: provision failed. Neither root key nor ubuntu sudo succeeded." >&2
+            echo "Troubleshooting: See docs/lab-runbook.md (## Troubleshooting)." >&2
+            exit 2
         fi
         ;;
     boot-vm)
         ensure_keys
+        check_seed_iso
+        local current_seed_hash
+        current_seed_hash="$(cat "$SEED_HASH_FILE")"
+        if [[ -f "$BOOTED_SEED_HASH_FILE" ]]; then
+            local recorded_seed_hash
+            recorded_seed_hash="$(cat "$BOOTED_SEED_HASH_FILE")"
+            if [[ "$recorded_seed_hash" != "$current_seed_hash" ]]; then
+                echo "FATAL: seed changed; run reset-overlay" >&2
+                exit 1
+            fi
+        fi
+
         if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
             echo "VM already running (PID $(cat "$PID_FILE"))."
             exit 0
@@ -199,7 +231,7 @@ case "$ACTION" in
         if [[ ! -f "$OVERLAY_IMAGE" ]]; then
             "$0" create-overlay
         fi
-        check_seed_iso
+
         qemu-system-x86_64 \
             -enable-kvm \
             -cpu host \
@@ -212,6 +244,7 @@ case "$ACTION" in
             -display none \
             -pidfile "$PID_FILE" \
             -daemonize
+        echo "$current_seed_hash" > "$BOOTED_SEED_HASH_FILE"
         echo "Booted QEMU/KVM VM (PID $(cat "$PID_FILE")) with restrict=on on 127.0.0.1:${SSH_PORT}"
         ;;
     wait-ssh)

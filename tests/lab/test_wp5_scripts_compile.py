@@ -22,5 +22,7 @@ def test_lab_python_scripts_compile() -> None:
 def test_lab_shell_scripts_parse() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     for p in (repo_root / "lab").rglob("*.sh"):
-        res = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True, check=False)
+        res = subprocess.run(
+            ["bash", "-n", str(p)], capture_output=True, text=True, check=False
+        )
         assert res.returncode == 0, f"Shell syntax error in {p}: {res.stderr}"
