@@ -213,10 +213,8 @@ case "$ACTION" in
     boot-vm)
         ensure_keys
         check_seed_iso
-        local current_seed_hash
         current_seed_hash="$(cat "$SEED_HASH_FILE")"
         if [[ -f "$BOOTED_SEED_HASH_FILE" ]]; then
-            local recorded_seed_hash
             recorded_seed_hash="$(cat "$BOOTED_SEED_HASH_FILE")"
             if [[ "$recorded_seed_hash" != "$current_seed_hash" ]]; then
                 echo "FATAL: seed changed; run reset-overlay" >&2

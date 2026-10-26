@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from gateheal.collector import IncidentCollector
@@ -28,13 +29,20 @@ from gateheal.lab_bringup import (
 )
 from gateheal.models import ActionId
 from gateheal.orchestrator import IncidentOrchestrator
-from gateheal.policy import load_operator_hmac_key, mint_approval_token
+from gateheal.policy import PolicyEngine, load_operator_hmac_key, mint_approval_token
 from gateheal.state import PersistentStateStore
 from gateheal.transport import (
     RecordingTransport,
     SSHLabTransport,
     TransportUnavailableError,
 )
+
+
+def _constant_key_loader(key: bytes) -> Callable[[], bytes | None]:
+    def _load() -> bytes | None:
+        return key
+
+    return _load
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -404,6 +412,10 @@ def main(argv: list[str] | None = None) -> int:
                     recording_transport.reset_counts()
                     orchestrator = IncidentOrchestrator(
                         cfg,
+                        policy_engine=PolicyEngine(
+                            cfg,
+                            hmac_key_loader=_constant_key_loader(hmac_k),
+                        ),
                         transport=recording_transport,
                         audit_recorder=AuditRecorder(
                             tmp_dir / f"{inc_id}_audit.jsonl"
@@ -413,11 +425,6 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         state_store=state_store,
                     )
-                    if exp.requires_approval_token:
-                        orchestrator.policy_engine._hmac_key_loader = (
-                            lambda _k=hmac_k: _k
-                        )
-
                     t_start = time.monotonic()
                     audit = orchestrator.handle_incident(
                         incident_id=inc_id,
@@ -518,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
         guest_kernel=guest_kernel,
         guest_systemd_version=guest_systemd_version,
         guest_machine_id_sha256=guest_machine_id_sha256,
-        controller_key_root_login_denied=controller_key_root_login_denied,
+        controller_key_root_login_denied=controller_key_root_denied,
         base_image_release=recorded_release or DEFAULT_PINNED_UBUNTU_RELEASE,
         base_image_upstream_sha256=recorded_upstream_sha,
         base_image_path=vm_dir / "ubuntu-24.04-base.qcow2",

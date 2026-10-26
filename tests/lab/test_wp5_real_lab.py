@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,7 +29,7 @@ from gateheal.lab_bringup import (
 )
 from gateheal.models import ActionId
 from gateheal.orchestrator import IncidentOrchestrator
-from gateheal.policy import mint_approval_token
+from gateheal.policy import PolicyEngine, mint_approval_token
 from gateheal.state import PersistentStateStore
 from gateheal.transport import (
     RecordingTransport,
@@ -39,6 +39,13 @@ from gateheal.transport import (
 )
 
 pytestmark = pytest.mark.lab
+
+
+def _constant_key_loader(key: bytes) -> Callable[[], bytes | None]:
+    def _load() -> bytes | None:
+        return key
+
+    return _load
 
 
 def _repo_root() -> Path:
@@ -320,9 +327,7 @@ def test_wp5_latency_profiler_and_manifest_builder_with_captured_fixtures(
 
         approval_token = None
         if exp.requires_approval_token:
-            pre_collector = IncidentCollector(
-                cfg, clock_utc=lambda: now_dt
-            )
+            pre_collector = IncidentCollector(cfg)
             pre_inc = pre_collector.collect_from_transport(
                 incident_id=inc_id,
                 target_unit="lab-api.service",
@@ -343,6 +348,11 @@ def test_wp5_latency_profiler_and_manifest_builder_with_captured_fixtures(
         )
         orch = IncidentOrchestrator(
             cfg,
+            policy_engine=PolicyEngine(
+                cfg,
+                clock_utc=lambda: now_dt,
+                hmac_key_loader=_constant_key_loader(test_hmac_key),
+            ),
             transport=rec_transport,
             audit_recorder=AuditRecorder(
                 tmp_path / f"{inc_id}_audit.jsonl", clock_utc=lambda: now_dt
@@ -353,9 +363,6 @@ def test_wp5_latency_profiler_and_manifest_builder_with_captured_fixtures(
             monotonic_clock=_mono,
             sleep_fn=_sleep,
         )
-        if exp.requires_approval_token:
-            orch.policy_engine._hmac_key_loader = lambda: test_hmac_key
-
         audit = orch.handle_incident(
             incident_id=inc_id,
             target_unit="lab-api.service",

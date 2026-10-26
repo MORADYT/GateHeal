@@ -8,7 +8,6 @@ import pytest
 
 from gateheal.config import GateHealConfig, load_config
 from gateheal.models import (
-    ActionId,
     ActionProposal,
     FaultClass,
     IncidentRecord,
@@ -16,7 +15,6 @@ from gateheal.models import (
 )
 from gateheal.policy import PolicyEngine
 from gateheal.transport import (
-    EXPECTED_SENTINEL_TOKEN,
     HostSafetyViolationError,
     LocalLabSubprocessTransport,
     SSHLabTransport,
