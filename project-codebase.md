@@ -106,11 +106,86 @@ tests/
   conftest.py
 .env.example
 .gitignore
+check_repo_integrity.sh
 pyproject.toml
 README.md
+repair_duplicates.py
 ````
 
 # Files
+
+## File: check_repo_integrity.sh
+````bash
+#!/usr/bin/env bash
+# Run from the GateHeal repo root BEFORE ruff/mypy/pytest and before packing the repo.
+# Detects: syntax errors, files that contain two glued copies of themselves, and stray files.
+set -u
+fail=0
+red() { printf 'INTEGRITY FAIL: %s\n' "$1"; fail=1; }
+
+# 1. Python files must compile; shell scripts must parse.
+while IFS= read -r f; do
+    python3 -m py_compile "$f" 2>/dev/null || red "python syntax error: $f"
+done < <(find src tests lab -name '*.py' -not -path '*/__pycache__/*')
+while IFS= read -r f; do
+    bash -n "$f" 2>/dev/null || red "shell syntax error: $f"
+done < <(find lab -name '*.sh')
+
+# 2. A file whose first line text appears again later in the same file is a duplicated/glued copy.
+while IFS= read -r f; do
+    first="$(head -n1 "$f")"
+    [ "${#first}" -ge 12 ] || continue
+    n="$(grep -cF -- "$first" "$f" || true)"
+    [ "$n" -le 1 ] || red "first line repeated ${n}x (duplicated content): $f"
+done < <(find src tests lab -type f \( -name '*.py' -o -name '*.sh' \) -not -path '*/__pycache__/*')
+
+# 3. Stray files that must never be in the repo.
+for p in project-codebase.md tests/lab/project-codebase.md fixtures test_wp5_real_lab.py \
+         test_wp5_collector_on_real_fixtures.py; do
+    [ -e "$p" ] && red "stray file or directory at repo root or tests/lab: $p"
+done
+find . -name 'project-codebase*.md' -not -path './.git/*' -not -path './.venv/*' | while read -r f; do
+    printf 'INTEGRITY FAIL: packed-repo dump inside the repo: %s\n' "$f"
+done | grep -q . && fail=1
+
+# 4. A line 1 that starts with a bare file name glued to a docstring (e.g. lab_bringup.py"""...).
+while IFS= read -r f; do
+    head -n1 "$f" | grep -Eq '^[A-Za-z0-9_./-]+\.(py|sh)("""|#!)' && red "garbage file name glued to line 1: $f"
+done < <(find src tests lab -type f \( -name '*.py' -o -name '*.sh' \) -not -path '*/__pycache__/*')
+
+if [ "$fail" -eq 0 ]; then echo "INTEGRITY OK"; else echo "INTEGRITY FAILED"; exit 1; fi
+````
+
+## File: repair_duplicates.py
+````python
+#!/usr/bin/env python3
+"""GateHeal repo repair: keep the first complete copy of files that were applied as glued duplicates.
+Run from repo root:  python3 repair_duplicates.py   (makes .bak copies; refuses unknown inputs)"""
+import hashlib, pathlib, re, shutil, sys
+FILES = {'src/gateheal/transport.py': '"""Isolated command transport layer preventing accidental host execution.', 'src/gateheal/lab_bringup.py': '"""WP5 real-lab conformance parser, SSH latency profiler, S', 'src/gateheal/agent.py': '"""Bounded LLM/Agentic proposal engines', 'lab/qemu/manage_vm.sh': '#!/usr/bin/env bash', 'lab/scripts/check_conformance.sh': '#!/usr/bin/env bash', 'lab/scripts/provision_guest.sh': '#!/usr/bin/env bash'}
+HASHES = {'src/gateheal/transport.py': 'd50f7bd7c9d11cc3880b01aadc3a7a48d9ae1a1f34aa6bed647de57a0d2727d7', 'src/gateheal/lab_bringup.py': 'a2423d5807cee9c756ea6ed2f5f3475ece6a30d54f599ee1da11ab0397d51d94', 'src/gateheal/agent.py': '28418681d24ee730b1d96df3f317760affc06ee3288897dec3d8849c4012afd4', 'lab/qemu/manage_vm.sh': '6d57cae5400bce744736aef78016c0cd90859e655fae2878426d9ada7cf75371', 'lab/scripts/check_conformance.sh': '07b8b0c31e40a8b49955853193941ecc4dcf12e031d554e4cfb06a341f1c319d', 'lab/scripts/provision_guest.sh': 'cedec7ab10e1c1cf6385298a54428ce6e6c908c45fe44a665fb287048ac1b9ff'}
+rc = 0
+for f, key in FILES.items():
+    p = pathlib.Path(f)
+    if not p.exists():
+        print("MISSING", f); rc = 1; continue
+    raw = p.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != HASHES[f]:
+        print("SKIP (content differs from the audited corrupted file)", f); rc = 1; continue
+    t = raw.decode()
+    idx = [m.start() for m in re.finditer(re.escape(key), t)]
+    part = t[idx[0]:idx[1]] if len(idx) > 1 else t[idx[0]:]
+    if f.endswith("lab_bringup.py"):
+        part = re.sub(r"\n    \)lab_bringup\.py\s*$", "\n    )", part.rstrip("\n")) 
+    if f.endswith("provision_guest.sh"):
+        part = part.replace("printf 'from=\"127.0.0.1\" %s\\n'", "printf '%s\\n'")
+        part = part.replace(' with from="127.0.0.1"', "")
+        assert 'from="127.0.0.1"' not in part.split("PROVISION_OK")[0], "from= option still present"
+    shutil.copy(p, str(p) + ".bak")
+    p.write_text(part.rstrip("\n") + "\n")
+    print("REPAIRED", f)
+sys.exit(rc)
+````
 
 ## File: .github/workflows/ci.yml
 ````yaml
@@ -148,183 +223,6 @@ jobs:
 
       - name: Run Pytest suite
         run: uv run pytest -v
-````
-
-## File: docs/lab-runbook.md
-````markdown
-# GateHeal WP5 Real-Lab Runbook (QEMU/KVM Guest Bring-Up & Conformance)
-
-## 1 Prerequisites
-All destructive fault-injection and `systemd` mutation tests execute strictly inside a disposable Ubuntu 24.04 QEMU/KVM guest over loopback SSH (`127.0.0.1:2222`) with QEMU user-network `restrict=on` (blocking guest outbound access).
-
-Required host packages and tools:
-- `qemu-system-x86_64` and `qemu-img` with `/dev/kvm` read/write access
-- `cloud-localds`, `xorriso`, `genisoimage`, or `mtools` + `dosfstools` (for cloud-init seed ISO creation)
-- `openssh-client` (`ssh`, `ssh-keygen`, `scp`), `rsync`, `curl`, and `sha256sum`
-- `uv` with Python 3.11+
-
-Key and host-key isolation paths under `~/.cache/gateheal-vm` (overridable via `GATEHEAL_VM_DIR`):
-- Controller SSH key (unprivileged `ubuntu` only): `~/.cache/gateheal-vm/id_ed25519` (`GATEHEAL_LAB_SSH_KEY`)
-- Harness SSH key (`root` from `127.0.0.1` only): `~/.cache/gateheal-vm/id_harness_ed25519` (`GATEHEAL_LAB_HARNESS_KEY`)
-- Dedicated lab `known_hosts`: `~/.cache/gateheal-vm/known_hosts` (`GATEHEAL_LAB_KNOWN_HOSTS`)
-
-## 2 Bootstrap
-Download the version-pinned Ubuntu 24.04 cloud image (`release-YYYYMMDD`), verify its digest against `SHA256SUMS` via `sha256sum -c`, generate the separated controller and harness SSH keys, and create a fresh qcow2 overlay:
-
-```bash
-bash lab/qemu/manage_vm.sh bootstrap-base
-bash lab/qemu/manage_vm.sh create-overlay
-```
-
-## 3 Boot and wait-ssh
-Boot the QEMU/KVM virtual machine in the background with user-mode networking (`restrict=on`, port forwarding `127.0.0.1:2222 -> :22`) and wait until loopback SSH is reachable using the dedicated `~/.cache/gateheal-vm/known_hosts` file:
-
-```bash
-bash lab/qemu/manage_vm.sh boot-vm
-bash lab/qemu/manage_vm.sh wait-ssh
-```
-
-## 4 Sync and provision
-Sync the repository to `/opt/gateheal` inside the guest and run `provision_guest.sh` as `root`. You can run `sync-repo` followed by `provision_guest.sh`, or invoke `provision` (which runs both idempotently), and then optionally freeze `lab-golden.qcow2` via `build-golden`:
-
-```bash
-bash lab/qemu/manage_vm.sh sync-repo
-ssh -p 2222 -i ~/.cache/gateheal-vm/id_harness_ed25519 \
-  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
-  -o StrictHostKeyChecking=accept-new \
-  root@127.0.0.1 "bash /opt/gateheal/lab/scripts/provision_guest.sh"
-```
-
-To run the combined idempotent action and freeze a golden backing image (`lab-golden.qcow2`) so future overlays do not need re-provisioning:
-
-```bash
-bash lab/qemu/manage_vm.sh provision
-bash lab/qemu/manage_vm.sh build-golden
-```
-
-## 5 Conformance
-Run the empirical `systemd` conformance and sudoers verification suite (`check_conformance.sh`) inside the guest via the root harness key:
-
-```bash
-ssh -p 2222 -i ~/.cache/gateheal-vm/id_harness_ed25519 \
-  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
-  -o StrictHostKeyChecking=accept-new \
-  root@127.0.0.1 "GATEHEAL_INSIDE_LAB=1 bash /opt/gateheal/lab/scripts/check_conformance.sh"
-```
-
-## 6 Capture and smoke
-Execute the host-side WP5 runner (`wp5_capture_and_verify.py`) to measure standard and multiplexed SSH latency, run conformance, execute all 7 smoke scenarios (`S0_HEALTHY_CONTROL` through `S5B_COLLATERAL_FORCED_RESTART`) across `--repeats 3`, atomically update the captured fixture if conformance passes, and write `artifacts/wp5_lab_manifest.json`. Then run the live pytest gate:
-
-```bash
-PYTHONUNBUFFERED=1 uv run python lab/scripts/wp5_capture_and_verify.py --repeats 3
-GATEHEAL_RUN_LAB_TESTS=1 uv run pytest -v -m lab
-```
-
-## 7 Reset between runs
-For fast per-trial resets without rebooting the VM, invoke `reset_lab.sh` inside the guest via the root harness key (or `manage_vm.sh reset-guest`):
-
-```bash
-ssh -p 2222 -i ~/.cache/gateheal-vm/id_harness_ed25519 \
-  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
-  -o StrictHostKeyChecking=accept-new \
-  root@127.0.0.1 "GATEHEAL_INSIDE_LAB=1 bash /opt/gateheal/lab/reset/reset_lab.sh"
-```
-
-For a full block-level disk reset between campaigns (automatically backed by `lab-golden.qcow2` if built, and clearing `~/.cache/gateheal-vm/known_hosts`):
-
-```bash
-bash lab/qemu/manage_vm.sh stop-vm
-bash lab/qemu/manage_vm.sh reset-overlay
-bash lab/qemu/manage_vm.sh boot-vm
-bash lab/qemu/manage_vm.sh wait-ssh
-```
-
-## 8 Teardown
-Stop the background QEMU/KVM process cleanly when finished:
-
-```bash
-bash lab/qemu/manage_vm.sh stop-vm
-```
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-| :--- | :--- | :--- |
-| `status STOPPED` (or `Connection refused` on port `2222`) | QEMU/KVM guest VM is not running. | Run `bash lab/qemu/manage_vm.sh boot-vm` and `bash lab/qemu/manage_vm.sh wait-ssh`. |
-| `Permission denied (publickey)` | Wrong key used for SSH user, or controller key used for `root`. | Set `GATEHEAL_LAB_SSH_KEY` to `~/.cache/gateheal-vm/id_ed25519` for `ubuntu` or pass `--harness-identity-file ~/.cache/gateheal-vm/id_harness_ed25519` for `root`. |
-| `Sentinel missing` (`HostSafetyViolationError` on `/etc/gateheal-lab-sentinel`) | Guest is unprovisioned, or overlay was recreated against raw base image without `lab-golden.qcow2`. | Run `bash lab/qemu/manage_vm.sh provision` (or `bash lab/qemu/manage_vm.sh build-golden`). |
-| `REMOTE HOST IDENTIFICATION HAS CHANGED` | Stale `known_hosts` entry after overlay recreation. | Delete `~/.cache/gateheal-vm/known_hosts` (or set `GATEHEAL_LAB_KNOWN_HOSTS`) and re-run `bash lab/qemu/manage_vm.sh wait-ssh`. |# GateHeal WP5 Real-Lab Runbook (QEMU/KVM Guest Bring-Up & Conformance)
-
-## 1. Isolation Architecture & Dual-Key Privilege Separation
-All destructive fault-injection and systemd mutation tests execute strictly inside an isolated Ubuntu 24.04 QEMU/KVM guest on loopback SSH (`127.0.0.1:2222`) with QEMU user-network `restrict=on` (blocking guest outbound access).
-
-- **Host & SSH Guards (E1):** `LocalLabSubprocessTransport` and `lab/scripts/lab_guard.sh` refuse execution on the Omarchy workstation kernel, without `GATEHEAL_INSIDE_LAB=1`, without `/etc/gateheal-lab-sentinel`, or on bare metal. `SSHLabTransport._ensure_remote_sentinel()` raises `TransportUnavailableError` (with `exit_code` and `stderr_excerpt`) when SSH fails to connect, and `HostSafetyViolationError` when `/etc/gateheal-lab-sentinel` mismatches `GATEHEAL_ISOLATED_LAB_GUEST_V1`.
-- **Dual SSH Key Separation (E6):**
-  - **Controller Key (`~/.cache/gateheal-vm/id_ed25519`):** Authorized only for unprivileged `ubuntu@127.0.0.1`, restricted by `/etc/sudoers.d/gateheal-lab` to the 4 exact `systemctl reload|restart` commands. Explicitly denied for `root@127.0.0.1`.
-  - **Harness Key (`~/.cache/gateheal-vm/id_ed25519_harness`):** Authorized for `root@127.0.0.1` strictly for test-harness fault injection (`inject_fault.sh`), lab resets (`reset_lab.sh`), and conformance checks (`check_conformance.sh`).
-
----
-
-## 2. Step-by-Step Bring-Up, Provisioning, Golden Image & Execution
-
-> **Warning on Overlays:** Running `manage_vm.sh create-overlay` or `reset-overlay` against the raw `ubuntu-24.04-base.qcow2` image erases all guest provisioning (`/etc/gateheal-lab-sentinel`, `/etc/sudoers.d/gateheal-lab`, systemd units, and `/opt/gateheal`). Either run `manage_vm.sh build-golden` once so future overlays are backed by the provisioned `ubuntu-24.04-golden.qcow2`, or use `manage_vm.sh reset-guest` for fast in-guest service resets between runs.
-
-### Step 2.1 Bootstrap Base Image (`SHA256SUMS`), Create Overlay, Boot & Wait for SSH
-```bash
-bash lab/qemu/manage_vm.sh bootstrap-base
-bash lab/qemu/manage_vm.sh create-overlay
-bash lab/qemu/manage_vm.sh boot-vm
-bash lab/qemu/manage_vm.sh wait-ssh
-```
-
-### Step 2.2 Sync Repository to `/opt/gateheal` & Provision Guest as Root
-```bash
-bash lab/scripts/sync_repo_to_guest.sh /opt/gateheal
-ssh -p 2222 -i ~/.cache/gateheal-vm/id_ed25519_harness root@127.0.0.1 \
-  "bash /opt/gateheal/lab/scripts/provision_guest.sh"
-```
-*(Optional E7 golden snapshot: run `bash lab/qemu/manage_vm.sh build-golden` to freeze the provisioned disk into `ubuntu-24.04-golden.qcow2`.)*
-
-### Step 2.3 Run Empirical `systemd` Conformance & Sudoers Suite
-```bash
-ssh -p 2222 -i ~/.cache/gateheal-vm/id_ed25519_harness root@127.0.0.1 \
-  "GATEHEAL_INSIDE_LAB=1 bash /opt/gateheal/lab/scripts/check_conformance.sh"
-```
-
-| Fact ID | Verified Property | Expected |
-| :--- | :--- | :---: |
-| `FACT_1_RESTART_NO_NRESTARTS_ZERO` | `Restart=no` leaves `NRestarts=0` after `SIGKILL` | `PASS` |
-| `FACT_2_INVOCATION_ID_RESTART_VS_RELOAD` | `InvocationID` & `ExecMainStartTimestampMonotonic` stay identical on `reload` and change on `restart` | `PASS` |
-| `FACT_3_SIGKILL_RESULT_SIGNAL` | `SIGKILL` on `lab-api.service` yields `ActiveState=failed`, `Result=signal` | `PASS` |
-| `FACT_4A_ACTIVE_API_RESTART_KILLS_WORKER` | Restarting active `lab-api.service` (`SIGTERM`) terminates coupled `lab-worker.service` | `PASS` |
-| `FACT_4B_START_FAILED_API_PRESERVES_WORKER` | Starting failed `lab-api.service` preserves `lab-worker.service` (`active`) | `PASS` |
-| `FACT_5_MANUAL_RESTART_NRESTARTS_BEHAVIOR` | Long-running probe unit killed once (`NRestarts=1`), manually restarted, and read after 1s resets `NRestarts=0` | `PASS` |
-| `SUDO_POS_*` (4 checks) | `ubuntu` allowed to run all 4 exact `gateheal-sudoers.conf` commands | `PASS` |
-| `SUDO_NEG_DENIED` (11 checks) | `ubuntu` denied on `stop`, `reload redis/worker`, `restart ssh`, `daemon-reload`, `/bin/sh`, and 5 argument-injection vectors | `PASS` |
-| `SSH_NEG_CONTROLLER_KEY_DENIED_ROOT` | Controller key `id_ed25519` rejected for `root@127.0.0.1` (`exit=255`) | `PASS` |
-
-### Step 2.4 Capture Live S1–S5 Smoke Matrix, Manifest & Run Live Pytest Gate
-```bash
-PYTHONUNBUFFERED=1 uv run python lab/scripts/wp5_capture_and_verify.py
-GATEHEAL_RUN_LAB_TESTS=1 uv run pytest -v -m lab
-```
-
-| Scenario ID | Diagnosed Fault | Selected Action | Target Unit | Verification Status | Samples | Escalated |
-| :--- | :--- | :--- | :--- | :--- | :---: | :---: |
-| `S1_SERVICE_CRASH` | `process_crash` | `restart_service` | `lab-api.service` | `recovered_clean` | `5` | `false` |
-| `S2_INVALID_CONFIG` | `invalid_config` | `abstain_and_escalate` | `lab-api.service` | `fault_persists_service_up` | `1` | `true` |
-| `S3_DEPENDENCY_FAILURE` | `dependency_failure` | `restart_service` | `lab-redis.service` | `recovered_clean` | `5` | `false` |
-| `S4_PERSISTENT_FAILURE` | `invalid_config` / `persistent_failure` | `abstain_and_escalate` | `lab-api.service` | `not_recovered` | `1` | `true` |
-| `S5_COLLATERAL_TRAP` | `degraded_running` | `reload_service` | `lab-api.service` | `recovered_clean` | `5` | `false` |
-
-### Step 2.5 In-Guest Reset & Teardown
-```bash
-# Fast in-guest reset without wiping overlay provisioning
-bash lab/qemu/manage_vm.sh reset-guest
-
-# Stop QEMU/KVM VM when finished
-bash lab/qemu/manage_vm.sh stop-vm
-```
 ````
 
 ## File: lab/reset/reset_lab.sh
@@ -968,137 +866,6 @@ fi
 echo "CONFORMANCE_SUMMARY: ALL_PASSED"
 ````
 
-## File: lab/scripts/provision_guest.sh
-````bash
-#!/usr/bin/env bash
-# Provision an isolated Ubuntu 24.04 QEMU/KVM guest for GateHeal WP5 (idempotent).
-set -euo pipefail
-
-KERNEL_REL="$(uname -r | tr '[:upper:]' '[:lower:]')"
-if [[ "$KERNEL_REL" == *"omarchy"* ]]; then
-    echo "FATAL: Refusing to provision on Omarchy host kernel ($KERNEL_REL)." >&2
-    exit 1
-fi
-
-if command -v systemd-detect-virt >/dev/null 2>&1; then
-    VIRT_TYPE="$(systemd-detect-virt)"
-    if [[ "$VIRT_TYPE" == "none" ]] || [[ -z "$VIRT_TYPE" ]]; then
-        echo "FATAL: systemd-detect-virt reported bare-metal host ($VIRT_TYPE)." >&2
-        exit 1
-    fi
-fi
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
-# 1. Install lab sentinel file
-echo "GATEHEAL_ISOLATED_LAB_GUEST_V1" > /etc/gateheal-lab-sentinel
-chmod 0644 /etc/gateheal-lab-sentinel
-
-# 2. Export GATEHEAL_INSIDE_LAB=1 in /etc/environment
-if ! grep -q '^GATEHEAL_INSIDE_LAB=1' /etc/environment 2>/dev/null; then
-    echo "GATEHEAL_INSIDE_LAB=1" >> /etc/environment
-fi
-
-# 3. Spec H: Install ONLY the dedicated harness public key for root with from="127.0.0.1"
-mkdir -p /root/.ssh
-chmod 0700 /root/.ssh
-if [[ ! -f "${REPO_ROOT}/.harness_key.pub" ]]; then
-    echo "FATAL: Missing ${REPO_ROOT}/.harness_key.pub; run 'bash lab/qemu/manage_vm.sh sync-repo' first." >&2
-    exit 1
-fi
-RAW_HARNESS_PUB="$(sed 's/^from="[^"]*"[[:space:]]*//' "${REPO_ROOT}/.harness_key.pub" | tr -d '\r\n')"
-if [[ -z "$RAW_HARNESS_PUB" ]]; then
-    echo "FATAL: Empty harness public key in ${REPO_ROOT}/.harness_key.pub" >&2
-    exit 1
-fi
-printf 'from="127.0.0.1" %s\n' "$RAW_HARNESS_PUB" > /root/.ssh/authorized_keys
-chmod 0600 /root/.ssh/authorized_keys
-
-# Grant ubuntu read-only journal access for unprivileged diagnostics (FACT_6)
-usermod -aG systemd-journal,adm ubuntu
-
-# 4. Install strict sudoers for `ubuntu` and remove cloud-init blanket NOPASSWD:ALL
-install -m 0440 "${REPO_ROOT}/lab/systemd/gateheal-sudoers.conf" /etc/sudoers.d/gateheal-lab
-visudo -cf /etc/sudoers.d/gateheal-lab
-rm -f /etc/sudoers.d/90-cloud-init-users
-
-# 5. Make gateheal importable by /usr/bin/python3 for systemd services
-SITE_PKGS="$(/usr/bin/python3 -c 'import site; print([p for p in site.getsitepackages() if "dist-packages" in p or "site-packages" in p][0])')"
-echo "${REPO_ROOT}/src" > "${SITE_PKGS}/gateheal.pth"
-
-# 6. Install systemd unit files
-install -m 0644 "${REPO_ROOT}/lab/systemd/lab-redis.service" /etc/systemd/system/lab-redis.service
-install -m 0644 "${REPO_ROOT}/lab/systemd/lab-api.service" /etc/systemd/system/lab-api.service
-install -m 0644 "${REPO_ROOT}/lab/systemd/lab-worker.service" /etc/systemd/system/lab-worker.service
-systemctl daemon-reload
-systemctl enable lab-redis.service lab-api.service lab-worker.service >/dev/null 2>&1 || true
-
-# 7. Initialize clean /etc/lab-api/config.yaml and start services
-export GATEHEAL_INSIDE_LAB=1
-bash "${REPO_ROOT}/lab/reset/reset_lab.sh"
-chmod 0644 /etc/lab-api/config.yaml
-echo "PROVISION_OK: GateHeal isolated lab guest is ready (root locked to from=\"127.0.0.1\" harness key)."#!/usr/bin/env bash
-# Provision an isolated Ubuntu 24.04 QEMU/KVM guest for GateHeal WP5.
-set -euo pipefail
-
-KERNEL_REL="$(uname -r | tr '[:upper:]' '[:lower:]')"
-if [[ "$KERNEL_REL" == *"omarchy"* ]]; then
-    echo "FATAL: Refusing to provision on Omarchy host kernel ($KERNEL_REL)." >&2
-    exit 1
-fi
-
-if command -v systemd-detect-virt >/dev/null 2>&1; then
-    VIRT_TYPE="$(systemd-detect-virt)"
-    if [[ "$VIRT_TYPE" == "none" ]] || [[ -z "$VIRT_TYPE" ]]; then
-        echo "FATAL: systemd-detect-virt reported bare-metal host ($VIRT_TYPE)." >&2
-        exit 1
-    fi
-fi
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
-# 1. Install lab sentinel file
-echo "GATEHEAL_ISOLATED_LAB_GUEST_V1" > /etc/gateheal-lab-sentinel
-chmod 0644 /etc/gateheal-lab-sentinel
-
-# 2. Export GATEHEAL_INSIDE_LAB=1 in /etc/environment
-if ! grep -q '^GATEHEAL_INSIDE_LAB=1' /etc/environment 2>/dev/null; then
-    echo "GATEHEAL_INSIDE_LAB=1" >> /etc/environment
-fi
-
-# 3. E6: Install ONLY the dedicated harness public key for root; forbid controller key on root
-mkdir -p /root/.ssh
-chmod 0700 /root/.ssh
-if [[ -f "${REPO_ROOT}/.harness_key.pub" ]]; then
-    install -m 0600 "${REPO_ROOT}/.harness_key.pub" /root/.ssh/authorized_keys
-else
-    echo "FATAL: Missing ${REPO_ROOT}/.harness_key.pub; run lab/scripts/sync_repo_to_guest.sh first." >&2
-    exit 1
-fi
-usermod -aG systemd-journal,adm ubuntu
-
-# 4. Install strict sudoers for `ubuntu` and remove cloud-init blanket NOPASSWD:ALL
-install -m 0440 "${REPO_ROOT}/lab/systemd/gateheal-sudoers.conf" /etc/sudoers.d/gateheal-lab
-visudo -cf /etc/sudoers.d/gateheal-lab
-rm -f /etc/sudoers.d/90-cloud-init-users
-
-# 5. Make gateheal importable by /usr/bin/python3 for systemd services
-SITE_PKGS="$(/usr/bin/python3 -c 'import site; print([p for p in site.getsitepackages() if "dist-packages" in p or "site-packages" in p][0])')"
-echo "${REPO_ROOT}/src" > "${SITE_PKGS}/gateheal.pth"
-
-# 6. Install systemd unit files
-install -m 0644 "${REPO_ROOT}/lab/systemd/lab-redis.service" /etc/systemd/system/lab-redis.service
-install -m 0644 "${REPO_ROOT}/lab/systemd/lab-api.service" /etc/systemd/system/lab-api.service
-install -m 0644 "${REPO_ROOT}/lab/systemd/lab-worker.service" /etc/systemd/system/lab-worker.service
-systemctl daemon-reload
-
-# 7. Initialize clean /etc/lab-api/config.yaml and start services
-export GATEHEAL_INSIDE_LAB=1
-bash "${REPO_ROOT}/lab/reset/reset_lab.sh"
-chmod 0644 /etc/lab-api/config.yaml
-echo "PROVISION_OK: GateHeal isolated lab guest is ready (root locked to harness key)."
-````
-
 ## File: lab/scripts/sync_repo_to_guest.sh
 ````bash
 #!/usr/bin/env bash
@@ -1140,459 +907,6 @@ scp -P "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     -i "$CONTROLLER_KEY" "${HARNESS_KEY}.pub" "ubuntu@127.0.0.1:${GUEST_DIR}/.harness_key.pub" >/dev/null
 
 echo "SYNC_OK: Synced repo and harness public key to ubuntu@127.0.0.1:${GUEST_DIR}"
-````
-
-## File: lab/scripts/wp5_capture_and_verify.py
-````python
-#!/usr/bin/env python3
-"""Host-side WP5 runner: executes conformance, multiplexed latency, S0-S5B smoke matrix, and manifest."""
-
-from __future__ import annotations
-
-import argparse
-import hashlib
-import json
-import os
-import sys
-import tempfile
-import time
-import uuid
-from pathlib import Path
-
-from gateheal.config import load_config
-from gateheal.controller import AuditRecorder, EscalationSink, default_artifacts_dir
-from gateheal.lab_bringup import (
-    ConformanceFactResult,
-    SmokeScenarioRunResult,
-    build_lab_run_manifest,
-    build_wp5_smoke_expectations,
-    measure_transport_latency,
-    parse_conformance_output,
-    wait_for_expected_pre_state,
-)
-from gateheal.models import ActionId
-from gateheal.orchestrator import IncidentOrchestrator
-from gateheal.state import PersistentStateStore
-from gateheal.transport import SSHLabTransport, TransportUnavailableError, RecordingTransport
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="wp5_capture_and_verify",
-        description="Run WP5 real-lab conformance, S0-S5B smoke matrix with --repeats, and capture fixtures.",
-    )
-    repo_root = Path(__file__).resolve().parents[2]
-    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", str(Path.home() / ".cache" / "gateheal-vm")))
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=repo_root / "configs" / "phase1_lab.yaml",
-    )
-    parser.add_argument("--ssh-host", type=str, default="127.0.0.1")
-    parser.add_argument("--ssh-port", type=int, default=2222)
-    parser.add_argument("--ssh-user", type=str, default="ubuntu")
-    parser.add_argument(
-        "--ssh-identity-file",
-        type=str,
-        default=str(vm_dir / "id_ed25519"),
-        help="Unprivileged controller SSH key (authorized only for ubuntu).",
-    )
-    parser.add_argument(
-        "--harness-identity-file",
-        type=str,
-        default=str(vm_dir / "id_harness_ed25519"),
-        help="Dedicated harness SSH key (authorized for root fault injection/reset).",
-    )
-    parser.add_argument(
-        "--guest-repo-dir",
-        type=str,
-        default="/opt/gateheal",
-        help="Path to GateHeal repo inside the guest VM.",
-    )
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=3,
-        help="Number of times to run each smoke scenario.",
-    )
-    parser.add_argument(
-        "--fixtures-out",
-        type=Path,
-        default=repo_root / "tests" / "lab" / "fixtures" / "vm_captured_systemd_facts.json",
-    )
-    parser.add_argument(
-        "--manifest-out",
-        type=Path,
-        default=default_artifacts_dir() / "wp5_lab_manifest.json",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    repo_root = Path(__file__).resolve().parents[2]
-    cfg = load_config(args.config)
-
-    transport = SSHLabTransport(
-        host=args.ssh_host,
-        port=args.ssh_port,
-        user=args.ssh_user,
-        identity_file=args.ssh_identity_file,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-    transport_mux = SSHLabTransport(
-        host=args.ssh_host,
-        port=args.ssh_port,
-        user=args.ssh_user,
-        identity_file=args.ssh_identity_file,
-        ssh_multiplex=True,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-    root_harness = SSHLabTransport(
-        host=args.ssh_host,
-        port=args.ssh_port,
-        user="root",
-        identity_file=args.harness_identity_file,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-
-    bad_root_transport = SSHLabTransport(
-        host=args.ssh_host,
-        port=args.ssh_port,
-        user="root",
-        identity_file=args.ssh_identity_file,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-    try:
-        bad_root_transport.run(("id",), timeout_sec=3.0)
-        controller_key_root_denied = False
-        e6_fact = ConformanceFactResult(
-            fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
-            passed=False,
-            details="SECURITY FAILURE: Controller key allowed to log in as root",
-        )
-    except TransportUnavailableError as exc:
-        controller_key_root_denied = exc.exit_code != 0
-        e6_fact = ConformanceFactResult(
-            fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
-            passed=controller_key_root_denied,
-            details=(
-                f"Controller key correctly rejected for root@{args.ssh_host} "
-                f"(exit_code={exc.exit_code})"
-            ),
-        )
-
-    try:
-        uname_res = transport.run(("uname", "-r"), timeout_sec=5.0)
-        sysd_res = transport.run(("systemctl", "--version"), timeout_sec=5.0)
-        machine_res = transport.run(("cat", "/etc/machine-id"), timeout_sec=5.0)
-    except TransportUnavailableError as exc:
-        print(f"ERROR: SSH transport unavailable: {exc}", file=sys.stderr)
-        print("Troubleshooting: Refer to docs/lab-runbook.md for troubleshooting.", file=sys.stderr)
-        return 2
-
-    guest_kernel = uname_res.stdout_excerpt.strip() or "unknown"
-    guest_systemd_version = (
-        sysd_res.stdout_excerpt.splitlines()[0].strip()
-        if sysd_res.stdout_excerpt.strip()
-        else "unknown"
-    )
-    raw_machine_id = machine_res.stdout_excerpt.strip()
-    guest_machine_id_sha256 = (
-        hashlib.sha256(raw_machine_id.encode("utf-8")).hexdigest()
-        if raw_machine_id
-        else None
-    )
-
-    latency_profile = measure_transport_latency(transport, samples=10)
-    latency_mux_profile = measure_transport_latency(transport_mux, samples=10)
-
-    try:
-        conf_res = root_harness.run(
-            (
-                "env",
-                "GATEHEAL_INSIDE_LAB=1",
-                "bash",
-                f"{args.guest_repo_dir}/lab/scripts/check_conformance.sh",
-            ),
-            timeout_sec=45.0,
-        )
-    except TransportUnavailableError as exc:
-        print(f"ERROR: Harness transport unavailable during conformance: {exc}", file=sys.stderr)
-        return 2
-
-    conformance_facts = (*parse_conformance_output(conf_res.stdout_excerpt), e6_fact)
-    conformance_all_passed = bool(conformance_facts) and all(f.passed for f in conformance_facts)
-
-    smoke_results: list[SmokeScenarioRunResult] = []
-    captured_show_outputs: dict[str, dict[str, str]] = {}
-    scenarios_probes_data: dict[str, dict[str, object]] = {}
-
-    recording_transport = RecordingTransport(transport)
-
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir_str:
-            tmp_dir = Path(tmp_dir_str)
-            for exp in build_wp5_smoke_expectations():
-                for repeat_idx in range(1, args.repeats + 1):
-                    _ = root_harness.run(
-                        (
-                            "env",
-                            "GATEHEAL_INSIDE_LAB=1",
-                            "bash",
-                            f"{args.guest_repo_dir}/lab/reset/reset_lab.sh",
-                        ),
-                        timeout_sec=15.0,
-                    )
-                    if exp.fault_injection_arg is not None:
-                        _ = root_harness.run(
-                            (
-                                "env",
-                                "GATEHEAL_INSIDE_LAB=1",
-                                "bash",
-                                f"{args.guest_repo_dir}/lab/fault_injection/inject_fault.sh",
-                                exp.fault_injection_arg,
-                            ),
-                            timeout_sec=10.0,
-                        )
-                    if exp.scenario_id == "S5_COLLATERAL_TRAP" and exp.seed_prior_recovery_attempts == 0:
-                        _ = root_harness.run(
-                            ("systemctl", "restart", "lab-api.service", "lab-worker.service"),
-                            timeout_sec=10.0,
-                        )
-
-                    recording_transport.reset_counts()
-                    _ = wait_for_expected_pre_state(
-                        recording_transport,
-                        exp.expected_pre_active_states,
-                        timeout_sec=20.0,
-                        poll_interval_sec=0.5,
-                        grace_wait_sec=5.5,
-                    )
-
-                    scen_captures: dict[str, str] = {}
-                    for unit_name in cfg.inventory.services:
-                        show_r = recording_transport.run(
-                            (
-                                "systemctl",
-                                "show",
-                                unit_name,
-                                "--property=ActiveState,SubState,Result,NRestarts,CanReload,"
-                                "ActiveEnterTimestampMonotonic,InvocationID,ExecMainStartTimestampMonotonic",
-                            ),
-                            timeout_sec=5.0,
-                        )
-                        scen_captures[unit_name] = show_r.stdout_excerpt
-                    if repeat_idx == 1:
-                        captured_show_outputs[exp.scenario_id] = scen_captures
-
-                    uptime_r = recording_transport.run(("cat", "/proc/uptime"), timeout_sec=3.0)
-                    jnl_r = recording_transport.run(
-                        (
-                            "journalctl", "-u", "lab-api.service", "-n", "20",
-                            "--no-pager", "-o", "short-monotonic",
-                        ),
-                        timeout_sec=5.0,
-                    )
-                    curl_r = recording_transport.run(
-                        (
-                            "curl", "-sS", "-w", r" HTTP=%{http_code}",
-                            "http://127.0.0.1:8080/healthz",
-                        ),
-                        timeout_sec=5.0,
-                    )
-                    tcp_6379_r = recording_transport.run(
-                        (
-                            "/usr/bin/python3", "-m", "gateheal.lab_daemons",
-                            "--check-tcp", "--host", "127.0.0.1", "--port", "6379",
-                        ),
-                        timeout_sec=3.0,
-                    )
-                    tcp_8081_r = recording_transport.run(
-                        (
-                            "/usr/bin/python3", "-m", "gateheal.lab_daemons",
-                            "--check-tcp", "--host", "127.0.0.1", "--port", "8081",
-                        ),
-                        timeout_sec=3.0,
-                    )
-                    val_cfg_r = recording_transport.run(
-                        (
-                            "/usr/bin/python3", "-m", "gateheal.lab_daemons",
-                            "--validate-config", "/etc/lab-api/config.yaml",
-                        ),
-                        timeout_sec=3.0,
-                    )
-                    if repeat_idx == 1:
-                        scenarios_probes_data[exp.scenario_id] = {
-                            "uptime": uptime_r.stdout_excerpt,
-                            "journal_api": jnl_r.stdout_excerpt,
-                            "curl_healthz": curl_r.stdout_excerpt,
-                            "tcp_6379_exit": tcp_6379_r.exit_code,
-                            "tcp_8081_exit": tcp_8081_r.exit_code,
-                            "validate_config_exit": val_cfg_r.exit_code,
-                        }
-
-                    inc_id = f"wp5-smoke-{exp.scenario_id.lower()}-r{repeat_idx}"
-                    state_store = PersistentStateStore(tmp_dir / f"{inc_id}.json")
-                    state_store.seed_unit_state(
-                        "lab-api.service",
-                        incident_id=inc_id,
-                        prior_recovery_attempts=exp.seed_prior_recovery_attempts,
-                        action_history=exp.seed_action_history,
-                    )
-                    approval_token = None
-                    if exp.requires_approval_token:
-                        from gateheal.policy import mint_approval_token, load_operator_hmac_key
-                        hmac_k = load_operator_hmac_key() or b"dev-operator-hmac-secret-key-32bytes-long!!"
-                        from gateheal.collector import IncidentCollector
-                        collector = IncidentCollector(cfg)
-                        collected_inc = collector.collect_from_transport(
-                            incident_id=inc_id,
-                            target_unit="lab-api.service",
-                            transport=recording_transport,
-                        )
-                        approval_token = mint_approval_token(
-                            token_id=f"tok-{repeat_idx}",
-                            incident=collected_inc,
-                            config=cfg,
-                            action_id=ActionId.RESTART_SERVICE.value,
-                            target_unit="lab-api.service",
-                            expires_at_utc="2099-01-01T00:00:00Z",
-                            hmac_key=hmac_k,
-                        )
-
-                    orchestrator = IncidentOrchestrator(
-                        cfg,
-                        transport=recording_transport,
-                        audit_recorder=AuditRecorder(tmp_dir / f"{inc_id}_audit.jsonl"),
-                        escalation_sink=EscalationSink(tmp_dir / f"{inc_id}_esc.jsonl"),
-                        state_store=state_store,
-                    )
-
-                    t_start = time.monotonic()
-                    audit = orchestrator.handle_incident(
-                        incident_id=inc_id,
-                        target_unit="lab-api.service",
-                        approval_token=approval_token,
-                    )
-                    wall_sec = round(max(0.0, time.monotonic() - t_start), 3)
-
-                    if audit.selected_proposal is None or audit.verification_report is None:
-                        raise RuntimeError(f"Scenario {exp.scenario_id} produced incomplete audit.")
-
-                    sel = audit.selected_proposal
-                    ver = audit.verification_report
-                    mut_exec = recording_transport.mutating_commands_executed
-                    total_cmds = recording_transport.ssh_command_count
-
-                    matched = (
-                        audit.diagnosis.fault_class in exp.expected_fault_classes
-                        and sel.action_id == exp.expected_action_id.value
-                        and sel.target_unit == exp.expected_target_unit
-                        and ver.status == exp.expected_verification_status
-                        and ver.collateral_failures == exp.expected_collateral_failures
-                        and audit.escalated == exp.expected_escalated
-                        and mut_exec == exp.expected_mutating_commands
-                    )
-                    budget_ok = wall_sec < cfg.budgets.total_incident_timeout_sec
-
-                    smoke_results.append(
-                        SmokeScenarioRunResult(
-                            scenario_id=exp.scenario_id,
-                            repeat_index=repeat_idx,
-                            diagnosed_fault=audit.diagnosis.fault_class,
-                            selected_action_id=sel.action_id,
-                            selected_target_unit=sel.target_unit,
-                            verification_status=ver.status,
-                            collateral_failures=ver.collateral_failures,
-                            samples_collected=ver.samples_collected,
-                            soak_wall_clock_sec=wall_sec,
-                            soak_budget_ok=budget_ok,
-                            ssh_command_count=total_cmds,
-                            mutating_commands_executed=mut_exec,
-                            escalated=audit.escalated,
-                            matched_expectation=matched,
-                        )
-                    )
-        try:
-            root_harness.run(
-                (
-                    "env", "GATEHEAL_INSIDE_LAB=1", "bash",
-                    f"{args.guest_repo_dir}/lab/reset/reset_lab.sh",
-                ),
-                timeout_sec=15.0,
-            )
-        except TransportUnavailableError:
-            pass
-
-    except TransportUnavailableError as exc:
-        print(f"ERROR: Transport unavailable during smoke execution: {exc}", file=sys.stderr)
-        print("Troubleshooting: Refer to docs/lab-runbook.md for troubleshooting.", file=sys.stderr)
-        return 2
-
-    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", str(Path.home() / ".cache" / "gateheal-vm")))
-    manifest = build_lab_run_manifest(
-        repo_root=repo_root,
-        config_path=args.config,
-        sudoers_path=repo_root / "lab" / "systemd" / "gateheal-sudoers.conf",
-        ssh_latency=latency_profile,
-        ssh_latency_multiplexed=latency_mux_profile,
-        conformance_facts=conformance_facts,
-        smoke_matrix=smoke_results,
-        guest_kernel=guest_kernel,
-        guest_systemd_version=guest_systemd_version,
-        guest_machine_id_sha256=guest_machine_id_sha256,
-        controller_key_root_login_denied=controller_key_root_denied,
-        base_image_path=vm_dir / "ubuntu-24.04-base.qcow2",
-        overlay_image_path=vm_dir / "lab-overlay.qcow2",
-        repeats=args.repeats,
-    )
-
-    args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
-    args.manifest_out.write_text(
-        manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
-    )
-
-    if conformance_all_passed:
-        fixture_payload = {
-            "capture_source": "LIVE_QEMU_KVM_GUEST",
-            "capture_id": uuid.uuid4().hex,
-            "captured_at_utc": manifest.generated_at_utc,
-            "guest_kernel": guest_kernel,
-            "guest_systemd_version": guest_systemd_version,
-            "guest_machine_id_sha256": guest_machine_id_sha256,
-            "conformance_facts": [f.model_dump() for f in conformance_facts],
-            "scenarios_systemctl_show": captured_show_outputs,
-            "scenarios_probes": scenarios_probes_data,
-        }
-        args.fixtures_out.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_fix_path = tempfile.mkstemp(dir=str(args.fixtures_out.parent), text=True)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as tf:
-                json.dump(fixture_payload, tf, indent=2)
-                tf.write("\n")
-            os.replace(tmp_fix_path, args.fixtures_out)
-        finally:
-            if os.path.exists(tmp_fix_path):
-                try:
-                    os.unlink(tmp_fix_path)
-                except OSError:
-                    pass
-
-    print(manifest.model_dump_json(indent=2))
-    return 0 if (manifest.conformance_all_passed and manifest.smoke_all_passed) else 1
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except TransportUnavailableError as exc:
-        print(f"ERROR: SSH to {exc} failed. Troubleshooting: see docs/lab-runbook.md.", file=sys.stderr)
-        sys.exit(2)
 ````
 
 ## File: lab/systemd/gateheal-sudoers.conf
@@ -1952,484 +1266,6 @@ class OpenAICompatibleAgentProposer:
                 llm_requests_used=1,
                 raw_error=str(exc),
             )
-````
-
-## File: src/gateheal/lab_bringup.py
-````python
-"""WP5 real-lab conformance parser, SSH latency profiler, S0-S5B smoke matrix, and manifest."""
-
-from __future__ import annotations
-
-import hashlib
-import statistics
-import subprocess
-import time
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Annotated
-
-from pydantic import BaseModel, ConfigDict, Field
-
-from gateheal.collector import parse_systemctl_show
-from gateheal.models import ActionId, FaultClass, VerificationStatus
-from gateheal.transport import CommandTransport
-
-DEFAULT_PINNED_UBUNTU_RELEASE = "current"
-
-
-class ConformanceFactResult(BaseModel):
-    """Single parsed PASS/FAIL line from `lab/scripts/check_conformance.sh`."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    fact_id: str
-    passed: bool
-    details: str
-
-
-class SSHLatencyProfile(BaseModel):
-    """Measured SSH command round-trip latency statistics in milliseconds."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    samples: Annotated[int, Field(ge=1)]
-    min_ms: Annotated[float, Field(ge=0.0)]
-    mean_ms: Annotated[float, Field(ge=0.0)]
-    p95_ms: Annotated[float, Field(ge=0.0)]
-    max_ms: Annotated[float, Field(ge=0.0)]
-
-
-class SmokeMatrixExpectation(BaseModel):
-    """Expected controller decision and verification outcome for a live lab scenario."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    scenario_id: str
-    fault_injection_arg: str | None
-    seed_prior_recovery_attempts: int = 0
-    seed_action_history: tuple[str, ...] = ()
-    requires_approval_token: bool = False
-    expected_pre_active_states: dict[str, str] = Field(
-        default_factory=lambda: {
-            "lab-redis.service": "active",
-            "lab-api.service": "active",
-            "lab-worker.service": "active",
-        }
-    )
-    expected_fault_classes: tuple[FaultClass, ...]
-    expected_action_id: ActionId
-    expected_target_unit: str
-    expected_verification_status: VerificationStatus
-    expected_collateral_failures: tuple[str, ...] = ()
-    expected_escalated: bool
-    expected_mutating_commands: int = 1
-
-
-class SmokeScenarioRunResult(BaseModel):
-    """Recorded live execution result for a single S0-S5B smoke scenario run."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    scenario_id: str
-    repeat_index: int = 1
-    diagnosed_fault: FaultClass
-    selected_action_id: str
-    selected_target_unit: str | None
-    verification_status: VerificationStatus
-    collateral_failures: tuple[str, ...] = ()
-    samples_collected: int
-    soak_wall_clock_sec: float
-    soak_budget_ok: bool = True
-    ssh_command_count: int = 0
-    mutating_commands_executed: int = 0
-    escalated: bool
-    matched_expectation: bool
-
-
-class LabRunManifest(BaseModel):
-    """Machine-readable WP5 lab bring-up and verification manifest."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    schema_version: str = "1.0"
-    generated_at_utc: str
-    git_sha: str
-    git_dirty: bool
-    config_sha256: str
-    sudoers_sha256: str
-    base_image_release: str = DEFAULT_PINNED_UBUNTU_RELEASE
-    base_image_sha256: str | None = None
-    base_image_upstream_sha256: str | None = None
-    overlay_image_sha256: str | None = None
-    guest_kernel: str = "unknown"
-    guest_systemd_version: str = "unknown"
-    guest_machine_id_sha256: str | None = None
-    controller_key_root_login_denied: bool = False
-    nrestarts_manual_restart_observation: str = "unknown"
-    ssh_latency: SSHLatencyProfile
-    ssh_latency_multiplexed: SSHLatencyProfile | None = None
-    conformance_facts: tuple[ConformanceFactResult, ...]
-    conformance_all_passed: bool
-    repeats: int = 1
-    flake_count: int = 0
-    soak_budget_ok: bool = True
-    smoke_matrix: tuple[SmokeScenarioRunResult, ...]
-    smoke_all_passed: bool
-
-
-def compute_file_sha256(path: Path) -> str:
-    """Compute hex SHA-256 digest of a file on disk."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def resolve_git_revision(repo_root: Path) -> tuple[str, bool]:
-    """Return (git_commit_sha, is_working_tree_dirty) for repo_root."""
-    try:
-        sha_proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_root.resolve()),
-            capture_output=True,
-            text=True,
-            timeout=3.0,
-            check=False,
-        )
-        sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else "unknown"
-        status_proc = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(repo_root.resolve()),
-            capture_output=True,
-            text=True,
-            timeout=3.0,
-            check=False,
-        )
-        dirty = bool(status_proc.stdout.strip())
-        return sha or "unknown", dirty
-    except OSError:
-        return "unknown", False
-
-
-def parse_conformance_output(raw_stdout: str) -> tuple[ConformanceFactResult, ...]:
-    """Parse PASS/FAIL lines emitted by `lab/scripts/check_conformance.sh`."""
-    results: list[ConformanceFactResult] = []
-    for raw_line in raw_stdout.splitlines():
-        line = raw_line.strip()
-        if line.startswith("PASS: ") or line.startswith("FAIL: "):
-            passed = line.startswith("PASS: ")
-            body = line[6:]
-            if " :: " in body:
-                fact_id, details = body.split(" :: ", 1)
-            else:
-                fact_id, details = body, ""
-            results.append(
-                ConformanceFactResult(
-                    fact_id=fact_id.strip(),
-                    passed=passed,
-                    details=details.strip(),
-                )
-            )
-    return tuple(results)
-
-
-def extract_nrestarts_observation(
-    conformance_facts: Sequence[ConformanceFactResult],
-) -> str:
-    """Extract `observed=<preserved|reset>` from FACT_5B_MANUAL_RESTART_NRESTARTS."""
-    for fact in conformance_facts:
-        if fact.fact_id == "FACT_5B_MANUAL_RESTART_NRESTARTS":
-            for token in fact.details.split():
-                if token.startswith("observed="):
-                    val = token.split("=", 1)[1].strip()
-                    if val:
-                        return val
-    return "unknown"
-
-
-def measure_transport_latency(
-    transport: CommandTransport,
-    *,
-    samples: int = 10,
-    monotonic_clock: Callable[[], float] = time.monotonic,
-) -> SSHLatencyProfile:
-    """Measure round-trip execution latency over transport in milliseconds."""
-    if samples < 1:
-        raise ValueError("samples must be >= 1")
-    durations_ms: list[float] = []
-    for _ in range(samples):
-        t0 = monotonic_clock()
-        res = transport.run(("systemctl", "--version"), timeout_sec=5.0)
-        elapsed_ms = max(0.0, (monotonic_clock() - t0) * 1000.0)
-        if res.timed_out or res.exit_code != 0:
-            raise RuntimeError(
-                f"Transport latency probe failed (exit={res.exit_code}, "
-                f"timed_out={res.timed_out})."
-            )
-        durations_ms.append(elapsed_ms)
-
-    sorted_ms = sorted(durations_ms)
-    p95_idx = min(len(sorted_ms) - 1, max(0, int(round(0.95 * (len(sorted_ms) - 1)))))
-    return SSHLatencyProfile(
-        samples=samples,
-        min_ms=round(sorted_ms[0], 3),
-        mean_ms=round(statistics.fmean(sorted_ms), 3),
-        p95_ms=round(sorted_ms[p95_idx], 3),
-        max_ms=round(sorted_ms[-1], 3),
-    )
-
-
-def wait_for_expected_pre_state(
-    transport: CommandTransport,
-    expected_active_states: dict[str, str],
-    *,
-    timeout_sec: float = 20.0,
-    poll_interval_sec: float = 0.5,
-    grace_wait_sec: float = 5.5,
-    monotonic_clock: Callable[[], float] = time.monotonic,
-    sleep_fn: Callable[[float], None] = time.sleep,
-) -> float:
-    """Poll until all units reach their expected pre-state, then sleep grace_wait_sec."""
-    start = monotonic_clock()
-    last_observed: dict[str, str] = {}
-
-    while True:
-        all_matched = True
-        for unit_name, expected_state in expected_active_states.items():
-            res = transport.run(
-                ("systemctl", "show", unit_name, "--property=ActiveState,SubState"),
-                timeout_sec=5.0,
-            )
-            props = parse_systemctl_show(res.stdout_excerpt)
-            actual_state = props.get("ActiveState", "unknown").strip()
-            last_observed[unit_name] = actual_state
-            if actual_state != expected_state:
-                all_matched = False
-
-        if all_matched:
-            if grace_wait_sec > 0.0:
-                sleep_fn(grace_wait_sec)
-            return max(0.0, monotonic_clock() - start)
-
-        if monotonic_clock() - start >= timeout_sec:
-            raise RuntimeError(
-                f"Timed out after {timeout_sec}s waiting for expected unit "
-                f"pre-states {expected_active_states}; last_observed={last_observed}"
-            )
-        sleep_fn(poll_interval_sec)
-
-
-def build_wp5_smoke_expectations() -> tuple[SmokeMatrixExpectation, ...]:
-    """Return the canonical 7-scenario S0-S5B smoke matrix expectations for WP5."""
-    return (
-        SmokeMatrixExpectation(
-            scenario_id="S0_HEALTHY_CONTROL",
-            fault_injection_arg=None,
-            expected_pre_active_states={
-                "lab-redis.service": "active",
-                "lab-api.service": "active",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(FaultClass.HEALTHY,),
-            expected_action_id=ActionId.NO_OP,
-            expected_target_unit="lab-api.service",
-            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
-            expected_collateral_failures=(),
-            expected_escalated=False,
-            expected_mutating_commands=0,
-        ),
-        SmokeMatrixExpectation(
-            scenario_id="S1_SERVICE_CRASH",
-            fault_injection_arg="S1_SERVICE_CRASH",
-            expected_pre_active_states={
-                "lab-redis.service": "active",
-                "lab-api.service": "failed",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(FaultClass.PROCESS_CRASH,),
-            expected_action_id=ActionId.RESTART_SERVICE,
-            expected_target_unit="lab-api.service",
-            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
-            expected_collateral_failures=(),
-            expected_escalated=False,
-            expected_mutating_commands=1,
-        ),
-        SmokeMatrixExpectation(
-            scenario_id="S2_INVALID_CONFIG",
-            fault_injection_arg="S2_INVALID_CONFIG",
-            expected_pre_active_states={
-                "lab-redis.service": "active",
-                "lab-api.service": "active",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(FaultClass.INVALID_CONFIG,),
-            expected_action_id=ActionId.ABSTAIN_AND_ESCALATE,
-            expected_target_unit="lab-api.service",
-            expected_verification_status=VerificationStatus.FAULT_PERSISTS_SERVICE_UP,
-            expected_collateral_failures=(),
-            expected_escalated=True,
-            expected_mutating_commands=0,
-        ),
-        SmokeMatrixExpectation(
-            scenario_id="S3_DEPENDENCY_FAILURE",
-            fault_injection_arg="S3_DEPENDENCY_FAILURE",
-            expected_pre_active_states={
-                "lab-redis.service": "failed",
-                "lab-api.service": "active",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(FaultClass.DEPENDENCY_FAILURE,),
-            expected_action_id=ActionId.RESTART_SERVICE,
-            expected_target_unit="lab-redis.service",
-            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
-            expected_collateral_failures=(),
-            expected_escalated=False,
-            expected_mutating_commands=1,
-        ),
-        SmokeMatrixExpectation(
-            scenario_id="S4_PERSISTENT_FAILURE",
-            fault_injection_arg="S4_PERSISTENT_FAILURE",
-            seed_prior_recovery_attempts=1,
-            seed_action_history=("restart_service:lab-api.service",),
-            expected_pre_active_states={
-                "lab-redis.service": "active",
-                "lab-api.service": "failed",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(
-                FaultClass.PERSISTENT_FAILURE,
-                FaultClass.INVALID_CONFIG,
-            ),
-            expected_action_id=ActionId.ABSTAIN_AND_ESCALATE,
-            expected_target_unit="lab-api.service",
-            expected_verification_status=VerificationStatus.NOT_RECOVERED,
-            expected_collateral_failures=(),
-            expected_escalated=True,
-            expected_mutating_commands=0,
-        ),
-        SmokeMatrixExpectation(
-            scenario_id="S5_COLLATERAL_TRAP",
-            fault_injection_arg="S5_COLLATERAL_TRAP",
-            expected_pre_active_states={
-                "lab-redis.service": "active",
-                "lab-api.service": "active",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(FaultClass.DEGRADED_RUNNING,),
-            expected_action_id=ActionId.RELOAD_SERVICE,
-            expected_target_unit="lab-api.service",
-            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
-            expected_collateral_failures=(),
-            expected_escalated=False,
-            expected_mutating_commands=1,
-        ),
-        SmokeMatrixExpectation(
-            scenario_id="S5B_COLLATERAL_FORCED_RESTART",
-            fault_injection_arg="S5_COLLATERAL_TRAP",
-            seed_prior_recovery_attempts=1,
-            seed_action_history=("reload_service:lab-api.service",),
-            requires_approval_token=True,
-            expected_pre_active_states={
-                "lab-redis.service": "active",
-                "lab-api.service": "active",
-                "lab-worker.service": "active",
-            },
-            expected_fault_classes=(FaultClass.DEGRADED_RUNNING,),
-            expected_action_id=ActionId.RESTART_SERVICE,
-            expected_target_unit="lab-api.service",
-            expected_verification_status=(
-                VerificationStatus.RECOVERED_WITH_COLLATERAL_FAILURE
-            ),
-            expected_collateral_failures=("lab-worker.service",),
-            expected_escalated=True,
-            expected_mutating_commands=1,
-        ),
-    )
-
-
-def _default_utc_now() -> datetime:
-    return datetime.now(UTC)
-
-
-def build_lab_run_manifest(
-    *,
-    repo_root: Path,
-    config_path: Path,
-    sudoers_path: Path,
-    ssh_latency: SSHLatencyProfile,
-    ssh_latency_multiplexed: SSHLatencyProfile | None = None,
-    conformance_facts: Sequence[ConformanceFactResult],
-    smoke_matrix: Sequence[SmokeScenarioRunResult],
-    guest_kernel: str = "unknown",
-    guest_systemd_version: str = "unknown",
-    guest_machine_id_sha256: str | None = None,
-    controller_key_root_login_denied: bool = False,
-    nrestarts_manual_restart_observation: str | None = None,
-    base_image_release: str = DEFAULT_PINNED_UBUNTU_RELEASE,
-    base_image_upstream_sha256: str | None = None,
-    base_image_path: Path | None = None,
-    overlay_image_path: Path | None = None,
-    repeats: int = 1,
-    clock_utc: Callable[[], datetime] | None = None,
-) -> LabRunManifest:
-    """Construct a validated LabRunManifest with git SHA and artifact hashes."""
-    now_fn: Callable[[], datetime] = (
-        _default_utc_now if clock_utc is None else clock_utc
-    )
-    git_sha, git_dirty = resolve_git_revision(repo_root)
-    cfg_hash = compute_file_sha256(config_path)
-    sudo_hash = compute_file_sha256(sudoers_path)
-    base_hash = (
-        compute_file_sha256(base_image_path)
-        if base_image_path is not None and base_image_path.is_file()
-        else None
-    )
-    ovl_hash = (
-        compute_file_sha256(overlay_image_path)
-        if overlay_image_path is not None and overlay_image_path.is_file()
-        else None
-    )
-    facts_tuple = tuple(conformance_facts)
-    smoke_tuple = tuple(smoke_matrix)
-    flake_count = sum(1 for s in smoke_tuple if not s.matched_expectation)
-    all_soak_budget_ok = bool(smoke_tuple) and all(
-        s.soak_budget_ok for s in smoke_tuple
-    )
-    observed_d4 = (
-        extract_nrestarts_observation(facts_tuple)
-        if nrestarts_manual_restart_observation is None
-        else nrestarts_manual_restart_observation
-    )
-    return LabRunManifest(
-        generated_at_utc=now_fn().isoformat(),
-        git_sha=git_sha,
-        git_dirty=git_dirty,
-        config_sha256=cfg_hash,
-        sudoers_sha256=sudo_hash,
-        base_image_release=base_image_release,
-        base_image_upstream_sha256=base_image_upstream_sha256,
-        base_image_sha256=base_hash,
-        overlay_image_sha256=ovl_hash,
-        guest_kernel=guest_kernel,
-        guest_systemd_version=guest_systemd_version,
-        guest_machine_id_sha256=guest_machine_id_sha256,
-        controller_key_root_login_denied=controller_key_root_login_denied,
-        nrestarts_manual_restart_observation=observed_d4,
-        ssh_latency=ssh_latency,
-        ssh_latency_multiplexed=ssh_latency_multiplexed,
-        conformance_facts=facts_tuple,
-        conformance_all_passed=bool(facts_tuple)
-        and all(f.passed for f in facts_tuple),
-        repeats=repeats,
-        flake_count=flake_count,
-        soak_budget_ok=all_soak_budget_ok,
-        smoke_matrix=smoke_tuple,
-        smoke_all_passed=bool(smoke_tuple)
-        and flake_count == 0
-        and all_soak_budget_ok,
-    )
 ````
 
 ## File: src/gateheal/orchestrator.py
@@ -6257,78 +5093,120 @@ inventory:
       downstream_dependents: []
 ````
 
-## File: docs/threat-model.md
+## File: docs/lab-runbook.md
 ````markdown
-# GateHeal Security & Threat Model (Phase 2 & WP2/WP3/WP4/WP5 Hardened)
+# GateHeal WP5 Real-Lab Runbook (QEMU/KVM Guest Bring-Up & Conformance)
 
-## 1. Trust Boundaries
-GateHeal enforces four explicit trust zones:
-1. **Zone 1 (Isolated Linux Lab):** Disposable QEMU/KVM Ubuntu VM verified via `/etc/gateheal-lab-sentinel` and `systemd-detect-virt`.
-2. **Zone 2 (Observation & Sanitization):** `IncidentCollector` performs best-effort full-text secret redaction before line splitting, enforces per-line byte caps (`512` B) and per-service fair byte budgets, keeps the newest tail lines, and wraps every log line in `[UNTRUSTED_LOG] `.
-3. **Zone 3 (Advisory Plane):** Deterministic `DiagnosisEngine` and bounded `AgentProposer` modules. Possesses zero subprocess execution authority.
-4. **Zone 4 (Independent Policy, Execution & Oracle Plane):** `PolicyEngine` (sole minting authority for single-use HMAC-signed `AuthorizedActionCapability` objects), `MinimalImpactSelector`, `ExecutionController`, `OutcomeVerifier` (independent multi-sample soak oracle), `EscalationSink`, and `AuditRecorder`.
+## 1 Prerequisites
+All destructive fault-injection and `systemd` mutation tests execute strictly inside a disposable Ubuntu 24.04 QEMU/KVM guest over loopback SSH (`127.0.0.1:2222`) with QEMU user-network `restrict=on` (blocking guest outbound access)[cite: 6].
 
-## 2. Host Workstation Protection & Guest Sudoers Contract
-- `LocalLabSubprocessTransport` requires `GATEHEAL_INSIDE_LAB=1`, a non-`omarchy` kernel, `/etc/gateheal-lab-sentinel` matching `GATEHEAL_ISOLATED_LAB_GUEST_V1`, and `systemd-detect-virt` reporting an allowed guest hypervisor/container.
-- `SSHLabTransport` enforces a loopback target IP (`127.0.0.1`/`::1`/`localhost`), validates `--ssh-user` against `^[a-z_][a-z0-9_-]{0,31}$`, places `--` before `user@host`, verifies `/etc/gateheal-lab-sentinel` over SSH by default (`verify_remote_sentinel=True`), and supports remote `timeout` + `/usr/bin/systemd-run --scope`.
-- Mutating service actions execute via `sudo -n /usr/bin/systemctl reload|restart <unit>`, matching the `visudo -cf` verified allowlist in `lab/systemd/gateheal-sudoers.conf`.
-- **Dual-Key Controller vs. Harness SSH Separation (E6/Spec H):** The controller uses an unprivileged SSH key (`id_ed25519`) authorized solely for `ubuntu` (and explicitly rejected for `root`), whereas fault injection and lab resets use a separate harness key (`id_ed25519_harness`) installed in `/root/.ssh/authorized_keys` with the strict option prefix `from="127.0.0.1"`. QEMU user networking runs with `restrict=on` (C4) so the guest cannot initiate outbound network connections.
+Required host packages and tools[cite: 6]:
+- `qemu-system-x86_64` and `qemu-img` with `/dev/kvm` read/write access[cite: 6]
+- `cloud-localds`, `xorriso`, `genisoimage`, or `mtools` + `dosfstools` (for cloud-init seed ISO creation)[cite: 6]
+- `openssh-client` (`ssh`, `ssh-keygen`, `scp`), `rsync`, `curl`, and `sha256sum`[cite: 6]
+- `uv` with Python 3.11+[cite: 6]
 
-## 3. Verified Mitigations vs. Known Limitations
-- **Verified in Automated Test Suite (`SIMULATED` & `LIVE_QEMU_KVM_GUEST`):**
-  - Closed `ActionId` enum lookup, strict unit regex (`^[a-z0-9_-]+\.service$`), inventory allowlisting, and `shell=False` argument vectors.
-  - Capability-bound `ExecutionController.execute()` with mandatory `expires_at_utc`, execution-time `PolicyEngine.evaluate()` re-verification, proposal/decision digest, and TOCTOU state-hash checks.
-  - Per-incident retry budgets (`incidents[incident_id]`) separated from persistent per-unit cooldowns and flap counters keyed by the mutated unit (`units[target_unit]`).
-  - Independent multi-sample `OutcomeVerifier` soak polling (`verification_soak_sec` / `verification_poll_interval_sec`) detecting crash recurrence via `NRestarts`, `InvocationID`, `ExecMainStartTimestampMonotonic`, and `active -> failed -> active` state transitions; read-only diagnostic actions, `no_op`, and `abstain_and_escalate` skip the soak window (`samples_collected=1`).
-  - Bounded `communicate(timeout=...)` and pipe closure after `os.killpg` so orphan grandchildren holding stdout/stderr pipes in a new session cannot hang the controller.
-  - Write-ahead (`"intent"` and `"completed"`) SHA-256 hash-chained audit logs with `.anchor` checkpoint persistence across log rotation.
-  - **Empirical systemd Conformance & Sudoers Negative Isolation (WP5):** Verified that `Restart=no` leaves `NRestarts=0` on `SIGKILL`, `InvocationID` and `ExecMainStartTimestampMonotonic` remain identical on `reload` and change on `restart`, `SIGKILL` yields `ActiveState=failed` and `Result=signal`, active restart terminates coupled workers while start-failed preserves them, and all argument-injection / unapproved sudo subcommands are strictly denied by `check_conformance.sh`.
-- **Known Limitations:**
-  - **Best-Effort Log Redaction:** Regex-based secret redaction (`redact_secrets_text`) scrubs known credential formats (complete and head/tail-truncated PEM blocks, JWTs, GitHub PATs, AWS keys/secrets, Stripe/Slack tokens, Basic/Bearer headers, cookies, and URL credentials), but cannot guarantee redaction of arbitrary custom or unformatted secrets.
-  - **Unkeyed Audit Hash Chain:** Without an external HMAC key (`GATEHEAL_AUDIT_HMAC_KEY`) stored outside the controller's writable directory, SHA-256 hash chaining is tamper-evident only against accidental corruption or truncation; a local attacker with write access to the log files can recompute unkeyed hashes.
-  - **Single-Process Prototype Key Storage:** In this prototype, the capability secret and `GATEHEAL_APPROVAL_HMAC_KEY` reside in the same OS process memory space as the controller.
-  - **Active-Session Coupling vs. `systemd` `PartOf=` / `BindsTo=` Coupling Limitation:** GateHeal's blast-radius model assumes starting a non-active (`failed`/`inactive`) unit has $B_{\text{dep}} = 0.0$ because no live process on the target is terminated. If a downstream unit uses `PartOf=` or `BindsTo=` in `systemd`, restarting a `failed` upstream unit can still trigger `systemd` to stop/restart the downstream unit unless that systemd-level propagation is encoded in the inventory. Therefore, `lab/systemd/lab-worker.service` uses `Wants=lab-api.service` rather than `BindsTo=` or `PartOf=`, and in the lab daemons (`lab_daemons.py`), `lab-api`'s `SIGTERM` handler notifies `lab-worker` when an active `lab-api` is hard-restarted (breaking `lab-worker` on an active restart in `S5`/`S2` while preserving `lab-worker` on `SIGHUP` reload or `S1` `SIGKILL` crash recovery).
-  - **Real-Lab VM Execution:** Full end-to-end execution against a live QEMU/KVM guest (`--transport ssh`) requires a booted guest image with `lab/systemd/gateheal-sudoers.conf` installed at `/etc/sudoers.d/gateheal-lab`.
-  - **Cross-Incident Restart Bounds:** Because `prior_recovery_attempts` and `action_history` are scoped per `incident_id` (R4), repeated mutating actions across distinct `incident_id`s are bounded **only** by the per-unit `cooldown_sec` and `flap_max_restarts` / `flap_window_sec` limits.
-  - **Strict All-Samples-Healthy Soak Rule vs. Slow Startup Grace (D2):** During post-action verification, `OutcomeVerifier` enforces a strict rule requiring **every** soak sample $1 \dots N$ (starting at $t_1 = \text{verification\_poll\_interval\_sec}$) to be healthy (`active`/`running` and probe passing), rather than excusing unhealthy early soak samples under `startup_grace_sec`. This deliberately trades potential false escalations on slow-starting services for fail-safe assurance.
-  - **In-Window Soak Unavailability vs. End-to-End MTTR (D3):** `VerificationReport.measured_unavailability_sec` (`in_window_unavailability_sec`) measures only in-window unavailability during the post-action soak window at poll-interval granularity (an upper bound). End-to-end MTTR comes from the experiment harness (`TrialOutcome.service_unavailability_sec`), not from `VerificationReport`.
-  - **Sub-Interval Crash-Before-First-Sample Gap (D4):** Because `systemctl restart` legitimately replaces `InvocationID` and `ExecMainStartTimestampMonotonic` relative to `pre_incident`, if a restarted service crashes and is respawned *before* the first soak sample ($t < t_1$) without incrementing `NRestarts` (e.g., an external wrapper restarting the binary before $t_1$), comparing sample 1 to `pre_incident` cannot distinguish that sub-interval crash from the requested restart; detection relies on `NRestarts` or recurrence across samples $1 \dots N$.
-  - **Shared Transport/Mechanism Between Collector and Verifier Oracle (D5):** Although `OutcomeVerifier` maintains a separate code path (`_probe_unit_oracle`) and never calls `IncidentCollector` or `DiagnosisEngine`, both query `systemctl show`, `curl`, and `gateheal.lab_daemons --check-tcp` over the same `CommandTransport`. A stronger application-level oracle can additionally parse and compare the JSON `"boot_id"` / `"reload_count"` fields returned by `GET /healthz`.
-  - **Unauthenticated Local Worker Abort Frame in Lab Daemon (D6):** In `gateheal.lab_daemons`, `lab-worker` accepts the `API_HARD_RESTART` termination frame from any local process connecting to `127.0.0.1:8081` without authentication. This is a lab-only fault/collateral simulation hook and not a hardened IPC protocol.# GateHeal Security & Threat Model (Phase 2 & WP2/WP3/WP4 Hardened)
+Key and host-key isolation paths under `~/.cache/gateheal-vm` (overridable via `GATEHEAL_VM_DIR`)[cite: 6]:
+- Controller SSH key (unprivileged `ubuntu` only): `~/.cache/gateheal-vm/id_ed25519` (`GATEHEAL_LAB_SSH_KEY`)[cite: 6]
+- Harness SSH key (`root` only, separate from controller key): `~/.cache/gateheal-vm/id_harness_ed25519` (`GATEHEAL_LAB_HARNESS_KEY`)[cite: 6]
+- Dedicated lab `known_hosts`: `~/.cache/gateheal-vm/known_hosts` (`GATEHEAL_LAB_KNOWN_HOSTS`)[cite: 6]
 
-## 1. Trust Boundaries
-GateHeal enforces four explicit trust zones:
-1. **Zone 1 (Isolated Linux Lab):** Disposable QEMU/KVM Ubuntu VM (or `systemd-nspawn` container) verified via `/etc/gateheal-lab-sentinel` and `systemd-detect-virt`.
-2. **Zone 2 (Observation & Sanitization):** `IncidentCollector` performs best-effort full-text secret redaction before line splitting, enforces per-line byte caps (`512` B) and per-service fair byte budgets, keeps the newest tail lines, and wraps every log line in `[UNTRUSTED_LOG] `.
-3. **Zone 3 (Advisory Plane):** Deterministic `DiagnosisEngine` and bounded `AgentProposer` modules. Possesses zero subprocess execution authority.
-4. **Zone 4 (Independent Policy, Execution & Oracle Plane):** `PolicyEngine` (sole minting authority for single-use HMAC-signed `AuthorizedActionCapability` objects), `MinimalImpactSelector`, `ExecutionController`, `OutcomeVerifier` (independent multi-sample soak oracle), `EscalationSink`, and `AuditRecorder`.
+## 2 Bootstrap
+Download the version-pinned Ubuntu 24.04 cloud image (`release-20250219`), verify its digest against `SHA256SUMS` via `sha256sum -c`, record `base.pin`, generate the separated controller and harness SSH keys, and create a fresh qcow2 overlay[cite: 6]:
 
-## 2. Host Workstation Protection & Guest Sudoers Contract
-- `LocalLabSubprocessTransport` requires `GATEHEAL_INSIDE_LAB=1`, a non-`omarchy` kernel, `/etc/gateheal-lab-sentinel` matching `GATEHEAL_ISOLATED_LAB_GUEST_V1`, and `systemd-detect-virt` reporting an allowed guest hypervisor/container.
-- `SSHLabTransport` enforces a loopback target IP (`127.0.0.1`/`::1`/`localhost`), validates `--ssh-user` against `^[a-z_][a-z0-9_-]{0,31}$`, places `--` before `user@host`, verifies `/etc/gateheal-lab-sentinel` over SSH by default (`verify_remote_sentinel=True`), and supports remote `timeout` + `/usr/bin/systemd-run --scope`.
-- Mutating service actions execute via `sudo -n /usr/bin/systemctl reload|restart <unit>`, matching the `visudo -cf` verified allowlist in `lab/systemd/gateheal-sudoers.conf`.
-- **Dual-Key Controller vs. Harness SSH Separation (E6):** The controller uses an unprivileged SSH key (`id_ed25519`) authorized solely for `ubuntu` (and explicitly rejected for `root`), whereas fault injection and lab resets use a separate harness key (`id_ed25519_harness`) installed in `/root/.ssh/authorized_keys`. QEMU user networking runs with `restrict=on` (E8) so the guest cannot initiate outbound network connections.
+```bash
+bash lab/qemu/manage_vm.sh bootstrap-base
+bash lab/qemu/manage_vm.sh create-overlay
+```
 
-## 3. Verified Mitigations vs. Known Limitations
-- **Verified in Automated Test Suite (`SIMULATED`):**
-  - Closed `ActionId` enum lookup, strict unit regex (`^[a-z0-9_-]+\.service$`), inventory allowlisting, and `shell=False` argument vectors.
-  - Capability-bound `ExecutionController.execute()` with mandatory `expires_at_utc`, execution-time `PolicyEngine.evaluate()` re-verification, proposal/decision digest, and TOCTOU state-hash checks.
-  - Per-incident retry budgets (`incidents[incident_id]`) separated from persistent per-unit cooldowns and flap counters keyed by the mutated unit (`units[target_unit]`).
-  - Independent multi-sample `OutcomeVerifier` soak polling (`verification_soak_sec` / `verification_poll_interval_sec`) detecting crash recurrence via `NRestarts`, `InvocationID`, `ExecMainStartTimestampMonotonic`, and `active -> failed -> active` state transitions; read-only diagnostic actions, `no_op`, and `abstain_and_escalate` skip the soak window (`samples_collected=1`).
-  - Bounded `communicate(timeout=...)` and pipe closure after `os.killpg` so orphan grandchildren holding stdout/stderr pipes in a new session cannot hang the controller.
-  - Write-ahead (`"intent"` and `"completed"`) SHA-256 hash-chained audit logs with `.anchor` checkpoint persistence across log rotation.
-- **Known Limitations:**
-  - **Best-Effort Log Redaction:** Regex-based secret redaction (`redact_secrets_text`) scrubs known credential formats (complete and head/tail-truncated PEM blocks, JWTs, GitHub PATs, AWS keys/secrets, Stripe/Slack tokens, Basic/Bearer headers, cookies, and URL credentials), but cannot guarantee redaction of arbitrary custom or unformatted secrets.
-  - **Unkeyed Audit Hash Chain:** Without an external HMAC key (`GATEHEAL_AUDIT_HMAC_KEY`) stored outside the controller's writable directory, SHA-256 hash chaining is tamper-evident only against accidental corruption or truncation; a local attacker with write access to the log files can recompute unkeyed hashes.
-  - **Single-Process Prototype Key Storage:** In this prototype, the capability secret and `GATEHEAL_APPROVAL_HMAC_KEY` reside in the same OS process memory space as the controller.
-  - **Active-Session Coupling vs. `systemd` `PartOf=` / `BindsTo=` Coupling Limitation:** GateHeal's blast-radius model assumes starting a non-active (`failed`/`inactive`) unit has $B_{\text{dep}} = 0.0$ because no live process on the target is terminated. If a downstream unit uses `PartOf=` or `BindsTo=` in `systemd`, restarting a `failed` upstream unit can still trigger `systemd` to stop/restart the downstream unit unless that systemd-level propagation is encoded in the inventory. Therefore, `lab/systemd/lab-worker.service` uses `Wants=lab-api.service` rather than `BindsTo=` or `PartOf=`, and in the lab daemons (`lab_daemons.py`), `lab-api`'s `SIGTERM` handler notifies `lab-worker` when an active `lab-api` is hard-restarted (breaking `lab-worker` on an active restart in `S5`/`S2` while preserving `lab-worker` on `SIGHUP` reload or `S1` `SIGKILL` crash recovery).
-  - **Real-Lab VM Execution:** Full end-to-end execution against a live QEMU/KVM guest (`--transport ssh`) requires a booted guest image with `lab/systemd/gateheal-sudoers.conf` installed at `/etc/sudoers.d/gateheal-lab`.
-  - **Cross-Incident Restart Bounds:** Because `prior_recovery_attempts` and `action_history` are scoped per `incident_id` (R4), repeated mutating actions across distinct `incident_id`s are bounded **only** by the per-unit `cooldown_sec` and `flap_max_restarts` / `flap_window_sec` limits.
-  - **Strict All-Samples-Healthy Soak Rule vs. Slow Startup Grace (D2):** During post-action verification, `OutcomeVerifier` enforces a strict rule requiring **every** soak sample $1 \dots N$ (starting at $t_1 = \text{verification\_poll\_interval\_sec}$) to be healthy (`active`/`running` and probe passing), rather than excusing unhealthy early soak samples under `startup_grace_sec`. This deliberately trades potential false escalations on slow-starting services for fail-safe assurance.
-  - **In-Window Soak Unavailability vs. End-to-End MTTR (D3):** `VerificationReport.measured_unavailability_sec` (`in_window_unavailability_sec`) measures only in-window unavailability during the post-action soak window at poll-interval granularity (an upper bound). End-to-end MTTR comes from the experiment harness (`TrialOutcome.service_unavailability_sec`), not from `VerificationReport`.
-  - **Sub-Interval Crash-Before-First-Sample Gap (D4):** Because `systemctl restart` legitimately replaces `InvocationID` and `ExecMainStartTimestampMonotonic` relative to `pre_incident`, if a restarted service crashes and is respawned *before* the first soak sample ($t < t_1$) without incrementing `NRestarts` (e.g., an external wrapper restarting the binary before $t_1$), comparing sample 1 to `pre_incident` cannot distinguish that sub-interval crash from the requested restart; detection relies on `NRestarts` or recurrence across samples $1 \dots N$.
-  - **Shared Transport/Mechanism Between Collector and Verifier Oracle (D5):** Although `OutcomeVerifier` maintains a separate code path (`_probe_unit_oracle`) and never calls `IncidentCollector` or `DiagnosisEngine`, both query `systemctl show`, `curl`, and `gateheal.lab_daemons --check-tcp` over the same `CommandTransport`. A stronger application-level oracle can additionally parse and compare the JSON `"boot_id"` / `"reload_count"` fields returned by `GET /healthz`.
-  - **Unauthenticated Local Worker Abort Frame in Lab Daemon (D6):** In `gateheal.lab_daemons`, `lab-worker` accepts the `API_HARD_RESTART` termination frame from any local process connecting to `127.0.0.1:8081` without authentication. This is a lab-only fault/collateral simulation hook and not a hardened IPC protocol.
+## 3 Boot and wait-ssh
+Boot the QEMU/KVM virtual machine in the background with user-mode networking (`restrict=on`, port forwarding `127.0.0.1:2222 -> :22`) and wait until loopback SSH is reachable using the dedicated `~/.cache/gateheal-vm/known_hosts` file[cite: 6]:
+
+```bash
+bash lab/qemu/manage_vm.sh boot-vm
+bash lab/qemu/manage_vm.sh wait-ssh
+```
+
+On the first boot of an overlay backed by `lab-golden.qcow2` (or immediately after provisioning), verify that `/etc/gateheal-lab-sentinel` is present inside the guest:
+
+```bash
+ssh -p 2222 -i ~/.cache/gateheal-vm/id_ed25519 \
+  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
+  -o StrictHostKeyChecking=accept-new \
+  ubuntu@127.0.0.1 "cat /etc/gateheal-lab-sentinel"
+```
+
+## 4 Sync and provision
+Use the `provision` action (which runs `sync-repo` and then executes `provision_guest.sh` as `root` idempotently), and optionally freeze `lab-golden.qcow2` via `build-golden` (which also runs `qemu-img check`) so future overlays do not need re-provisioning[cite: 6]:
+
+```bash
+bash lab/qemu/manage_vm.sh provision
+bash lab/qemu/manage_vm.sh build-golden
+```
+
+You can also invoke `sync-repo` and `provision_guest.sh` individually when iterating on guest scripts[cite: 6]:
+
+```bash
+bash lab/qemu/manage_vm.sh sync-repo
+ssh -p 2222 -i ~/.cache/gateheal-vm/id_harness_ed25519 \
+  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
+  -o StrictHostKeyChecking=accept-new \
+  root@127.0.0.1 "bash /opt/gateheal/lab/scripts/provision_guest.sh"
+```
+
+## 5 Conformance
+Run the empirical `systemd` conformance and sudoers verification suite (`check_conformance.sh`) inside the guest via the root harness key[cite: 6]:
+
+```bash
+ssh -p 2222 -i ~/.cache/gateheal-vm/id_harness_ed25519 \
+  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
+  -o StrictHostKeyChecking=accept-new \
+  root@127.0.0.1 "GATEHEAL_INSIDE_LAB=1 bash /opt/gateheal/lab/scripts/check_conformance.sh"
+```
+
+## 6 Capture and smoke
+Execute the host-side WP5 runner (`wp5_capture_and_verify.py`) to measure standard and multiplexed SSH latency, run conformance, execute all 7 smoke scenarios (`S0_HEALTHY_CONTROL` through `S5B_COLLATERAL_FORCED_RESTART`) across `--repeats 3`, atomically update the captured fixture (`fixture_version: 2`) if conformance passes, and write `artifacts/wp5_lab_manifest.json`[cite: 6]. Then run the live pytest gate[cite: 6]:
+
+```bash
+PYTHONUNBUFFERED=1 uv run python lab/scripts/wp5_capture_and_verify.py --repeats 3
+GATEHEAL_RUN_LAB_TESTS=1 uv run pytest -v -m lab
+```
+
+## 7 Reset between runs
+For fast per-trial resets without rebooting the VM, invoke `reset_lab.sh` inside the guest via the root harness key (or `manage_vm.sh reset-guest`)[cite: 6]:
+
+```bash
+ssh -p 2222 -i ~/.cache/gateheal-vm/id_harness_ed25519 \
+  -o UserKnownHostsFile=~/.cache/gateheal-vm/known_hosts \
+  -o StrictHostKeyChecking=accept-new \
+  root@127.0.0.1 "GATEHEAL_INSIDE_LAB=1 bash /opt/gateheal/lab/reset/reset_lab.sh"
+```
+
+For a full block-level disk reset between campaigns (automatically backed by `lab-golden.qcow2` if built, and clearing `~/.cache/gateheal-vm/known_hosts`)[cite: 6]:
+
+```bash
+bash lab/qemu/manage_vm.sh stop-vm
+bash lab/qemu/manage_vm.sh reset-overlay
+bash lab/qemu/manage_vm.sh boot-vm
+bash lab/qemu/manage_vm.sh wait-ssh
+```
+
+## 8 Teardown
+Stop the background QEMU/KVM process cleanly (graceful `systemctl poweroff` followed by process exit verification) when finished[cite: 6]:
+
+```bash
+bash lab/qemu/manage_vm.sh stop-vm
+```
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| :--- | :--- | :--- |
+| `status STOPPED` (or `Connection refused` on port `2222`) | QEMU/KVM guest VM is not running[cite: 6]. | Run `bash lab/qemu/manage_vm.sh boot-vm` and `bash lab/qemu/manage_vm.sh wait-ssh`[cite: 6]. |
+| `Permission denied (publickey)` | Wrong key used for SSH user, or controller key used for `root`[cite: 6]. | Set `GATEHEAL_LAB_SSH_KEY` to `~/.cache/gateheal-vm/id_ed25519` for `ubuntu` or pass `--harness-identity-file ~/.cache/gateheal-vm/id_harness_ed25519` for `root`[cite: 6]. |
+| `Sentinel missing` (`HostSafetyViolationError` on `/etc/gateheal-lab-sentinel`) | Guest is unprovisioned, or overlay was recreated against raw base image without `lab-golden.qcow2`[cite: 6]. | Run `bash lab/qemu/manage_vm.sh provision` (or `bash lab/qemu/manage_vm.sh build-golden`), then verify with `cat /etc/gateheal-lab-sentinel`[cite: 6]. |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | Stale `known_hosts` entry after overlay recreation[cite: 6]. | Delete `~/.cache/gateheal-vm/known_hosts` (or run `create-overlay` / `reset-overlay`) and re-run `bash lab/qemu/manage_vm.sh wait-ssh`[cite: 6]. |
+| Stale `seed.iso` (cloud-init keys out of sync after key regeneration) | `seed.iso` was built with older public keys or cloud-init `instance-id` already ran on the backing image. | Delete `~/.cache/gateheal-vm/seed.iso` and `~/.cache/gateheal-vm/seed.hash`, then run `bash lab/qemu/manage_vm.sh reset-overlay` and `bash lab/qemu/manage_vm.sh boot-vm`. |
 ````
 
 ## File: lab/fault_injection/inject_fault.sh
@@ -6396,6 +5274,716 @@ if command -v systemd-detect-virt >/dev/null 2>&1; then
         exit 1
     fi
 fi
+````
+
+## File: lab/scripts/provision_guest.sh
+````bash
+#!/usr/bin/env bash
+# Provision an isolated Ubuntu 24.04 QEMU/KVM guest for GateHeal WP5 (idempotent).
+set -euo pipefail
+
+KERNEL_REL="$(uname -r | tr '[:upper:]' '[:lower:]')"
+if [[ "$KERNEL_REL" == *"omarchy"* ]]; then
+    echo "FATAL: Refusing to provision on Omarchy host kernel ($KERNEL_REL)." >&2
+    exit 1
+fi
+
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    VIRT_TYPE="$(systemd-detect-virt)"
+    if [[ "$VIRT_TYPE" == "none" ]] || [[ -z "$VIRT_TYPE" ]]; then
+        echo "FATAL: systemd-detect-virt reported bare-metal host ($VIRT_TYPE)." >&2
+        exit 1
+    fi
+fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# 1. Install lab sentinel file
+echo "GATEHEAL_ISOLATED_LAB_GUEST_V1" > /etc/gateheal-lab-sentinel
+chmod 0644 /etc/gateheal-lab-sentinel
+
+# 2. Export GATEHEAL_INSIDE_LAB=1 in /etc/environment
+if ! grep -q '^GATEHEAL_INSIDE_LAB=1' /etc/environment 2>/dev/null; then
+    echo "GATEHEAL_INSIDE_LAB=1" >> /etc/environment
+fi
+
+# 3. Spec H: Install ONLY the dedicated harness public key for root with from="127.0.0.1"
+mkdir -p /root/.ssh
+chmod 0700 /root/.ssh
+if [[ ! -f "${REPO_ROOT}/.harness_key.pub" ]]; then
+    echo "FATAL: Missing ${REPO_ROOT}/.harness_key.pub; run 'bash lab/qemu/manage_vm.sh sync-repo' first." >&2
+    exit 1
+fi
+RAW_HARNESS_PUB="$(sed 's/^from="[^"]*"[[:space:]]*//' "${REPO_ROOT}/.harness_key.pub" | tr -d '\r\n')"
+if [[ -z "$RAW_HARNESS_PUB" ]]; then
+    echo "FATAL: Empty harness public key in ${REPO_ROOT}/.harness_key.pub" >&2
+    exit 1
+fi
+printf 'from="127.0.0.1" %s\n' "$RAW_HARNESS_PUB" > /root/.ssh/authorized_keys
+chmod 0600 /root/.ssh/authorized_keys
+
+# Grant ubuntu read-only journal access for unprivileged diagnostics (FACT_6)
+usermod -aG systemd-journal,adm ubuntu
+
+# 4. Install strict sudoers for `ubuntu` and remove cloud-init blanket NOPASSWD:ALL
+install -m 0440 "${REPO_ROOT}/lab/systemd/gateheal-sudoers.conf" /etc/sudoers.d/gateheal-lab
+visudo -cf /etc/sudoers.d/gateheal-lab
+rm -f /etc/sudoers.d/90-cloud-init-users
+
+# 5. Make gateheal importable by /usr/bin/python3 for systemd services
+SITE_PKGS="$(/usr/bin/python3 -c 'import site; print([p for p in site.getsitepackages() if "dist-packages" in p or "site-packages" in p][0])')"
+echo "${REPO_ROOT}/src" > "${SITE_PKGS}/gateheal.pth"
+
+# 6. Install systemd unit files
+install -m 0644 "${REPO_ROOT}/lab/systemd/lab-redis.service" /etc/systemd/system/lab-redis.service
+install -m 0644 "${REPO_ROOT}/lab/systemd/lab-api.service" /etc/systemd/system/lab-api.service
+install -m 0644 "${REPO_ROOT}/lab/systemd/lab-worker.service" /etc/systemd/system/lab-worker.service
+systemctl daemon-reload
+systemctl enable lab-redis.service lab-api.service lab-worker.service >/dev/null 2>&1 || true
+
+# 7. Initialize clean /etc/lab-api/config.yaml and start services
+export GATEHEAL_INSIDE_LAB=1
+bash "${REPO_ROOT}/lab/reset/reset_lab.sh"
+chmod 0644 /etc/lab-api/config.yaml
+echo "PROVISION_OK: GateHeal isolated lab guest is ready."#!/usr/bin/env bash
+# Provision an isolated Ubuntu 24.04 QEMU/KVM guest for GateHeal WP5.
+set -euo pipefail
+
+KERNEL_REL="$(uname -r | tr '[:upper:]' '[:lower:]')"
+if [[ "$KERNEL_REL" == *"omarchy"* ]]; then
+    echo "FATAL: Refusing to provision on Omarchy host kernel ($KERNEL_REL)." >&2
+    exit 1
+fi
+
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    VIRT_TYPE="$(systemd-detect-virt)"
+    if [[ "$VIRT_TYPE" == "none" ]] || [[ -z "$VIRT_TYPE" ]]; then
+        echo "FATAL: systemd-detect-virt reported bare-metal host ($VIRT_TYPE)." >&2
+        exit 1
+    fi
+fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# 1. Install lab sentinel file
+echo "GATEHEAL_ISOLATED_LAB_GUEST_V1" > /etc/gateheal-lab-sentinel
+chmod 0644 /etc/gateheal-lab-sentinel
+
+# 2. Export GATEHEAL_INSIDE_LAB=1 in /etc/environment
+if ! grep -q '^GATEHEAL_INSIDE_LAB=1' /etc/environment 2>/dev/null; then
+    echo "GATEHEAL_INSIDE_LAB=1" >> /etc/environment
+fi
+
+# 3. E6: Install ONLY the dedicated harness public key for root; forbid controller key on root
+mkdir -p /root/.ssh
+chmod 0700 /root/.ssh
+if [[ -f "${REPO_ROOT}/.harness_key.pub" ]]; then
+    install -m 0600 "${REPO_ROOT}/.harness_key.pub" /root/.ssh/authorized_keys
+else
+    echo "FATAL: Missing ${REPO_ROOT}/.harness_key.pub; run lab/scripts/sync_repo_to_guest.sh first." >&2
+    exit 1
+fi
+usermod -aG systemd-journal,adm ubuntu
+
+# 4. Install strict sudoers for `ubuntu` and remove cloud-init blanket NOPASSWD:ALL
+install -m 0440 "${REPO_ROOT}/lab/systemd/gateheal-sudoers.conf" /etc/sudoers.d/gateheal-lab
+visudo -cf /etc/sudoers.d/gateheal-lab
+rm -f /etc/sudoers.d/90-cloud-init-users
+
+# 5. Make gateheal importable by /usr/bin/python3 for systemd services
+SITE_PKGS="$(/usr/bin/python3 -c 'import site; print([p for p in site.getsitepackages() if "dist-packages" in p or "site-packages" in p][0])')"
+echo "${REPO_ROOT}/src" > "${SITE_PKGS}/gateheal.pth"
+
+# 6. Install systemd unit files
+install -m 0644 "${REPO_ROOT}/lab/systemd/lab-redis.service" /etc/systemd/system/lab-redis.service
+install -m 0644 "${REPO_ROOT}/lab/systemd/lab-api.service" /etc/systemd/system/lab-api.service
+install -m 0644 "${REPO_ROOT}/lab/systemd/lab-worker.service" /etc/systemd/system/lab-worker.service
+systemctl daemon-reload
+
+# 7. Initialize clean /etc/lab-api/config.yaml and start services
+export GATEHEAL_INSIDE_LAB=1
+bash "${REPO_ROOT}/lab/reset/reset_lab.sh"
+chmod 0644 /etc/lab-api/config.yaml
+echo "PROVISION_OK: GateHeal isolated lab guest is ready (root locked to harness key)."
+````
+
+## File: lab/scripts/wp5_capture_and_verify.py
+````python
+#!/usr/bin/env python3
+"""Host-side WP5 runner: conformance, multiplexed latency, S0-S5B smoke matrix, and manifest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+from gateheal.collector import IncidentCollector
+from gateheal.config import load_config
+from gateheal.controller import AuditRecorder, EscalationSink, default_artifacts_dir
+from gateheal.lab_bringup import (
+    DEFAULT_PINNED_UBUNTU_RELEASE,
+    ConformanceFactResult,
+    SmokeScenarioRunResult,
+    build_lab_run_manifest,
+    build_wp5_smoke_expectations,
+    measure_transport_latency,
+    parse_conformance_output,
+    wait_for_expected_pre_state,
+)
+from gateheal.models import ActionId
+from gateheal.orchestrator import IncidentOrchestrator
+from gateheal.policy import load_operator_hmac_key, mint_approval_token
+from gateheal.state import PersistentStateStore
+from gateheal.transport import (
+    RecordingTransport,
+    SSHLabTransport,
+    TransportUnavailableError,
+)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wp5_capture_and_verify",
+        description=(
+            "Run WP5 real-lab conformance, S0-S5B smoke matrix with --repeats, "
+            "and capture fixtures."
+        ),
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    default_vm_dir = str(Path.home() / ".cache" / "gateheal-vm")
+    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", default_vm_dir))
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=repo_root / "configs" / "phase1_lab.yaml",
+    )
+    parser.add_argument("--ssh-host", type=str, default="127.0.0.1")
+    parser.add_argument("--ssh-port", type=int, default=2222)
+    parser.add_argument("--ssh-user", type=str, default="ubuntu")
+    parser.add_argument(
+        "--ssh-identity-file",
+        type=str,
+        default=str(vm_dir / "id_ed25519"),
+        help="Unprivileged controller SSH key (authorized only for ubuntu).",
+    )
+    parser.add_argument(
+        "--harness-identity-file",
+        type=str,
+        default=str(vm_dir / "id_harness_ed25519"),
+        help="Dedicated harness SSH key (authorized for root fault injection/reset).",
+    )
+    parser.add_argument(
+        "--guest-repo-dir",
+        type=str,
+        default="/opt/gateheal",
+        help="Path to GateHeal repo inside the guest VM.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Number of times to run each smoke scenario.",
+    )
+    parser.add_argument(
+        "--fixtures-out",
+        type=Path,
+        default=(
+            repo_root / "tests" / "lab" / "fixtures" / "vm_captured_systemd_facts.json"
+        ),
+    )
+    parser.add_argument(
+        "--manifest-out",
+        type=Path,
+        default=default_artifacts_dir() / "wp5_lab_manifest.json",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    if args.repeats < 1:
+        raise ValueError("--repeats must be >= 1")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = load_config(args.config)
+
+    transport = SSHLabTransport(
+        host=args.ssh_host,
+        port=args.ssh_port,
+        user=args.ssh_user,
+        identity_file=args.ssh_identity_file,
+        use_remote_timeout=True,
+        verify_remote_sentinel=True,
+    )
+    transport_mux = SSHLabTransport(
+        host=args.ssh_host,
+        port=args.ssh_port,
+        user=args.ssh_user,
+        identity_file=args.ssh_identity_file,
+        ssh_multiplex=True,
+        use_remote_timeout=True,
+        verify_remote_sentinel=True,
+    )
+    root_harness = SSHLabTransport(
+        host=args.ssh_host,
+        port=args.ssh_port,
+        user="root",
+        identity_file=args.harness_identity_file,
+        use_remote_timeout=True,
+        verify_remote_sentinel=True,
+    )
+
+    controller_key_path = Path(args.ssh_identity_file).expanduser()
+    if not controller_key_path.is_file():
+        controller_key_root_denied = False
+        e6_fact = ConformanceFactResult(
+            fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+            passed=False,
+            details=f"Controller key file missing at {controller_key_path}",
+        )
+    else:
+        bad_root_transport = SSHLabTransport(
+            host=args.ssh_host,
+            port=args.ssh_port,
+            user="root",
+            identity_file=str(controller_key_path),
+            use_remote_timeout=True,
+            verify_remote_sentinel=True,
+        )
+        try:
+            bad_root_transport.run(("true",), timeout_sec=3.0)
+            controller_key_root_denied = False
+            e6_fact = ConformanceFactResult(
+                fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+                passed=False,
+                details="SECURITY FAILURE: Controller key allowed to log in as root",
+            )
+        except TransportUnavailableError as exc:
+            controller_key_root_denied = (
+                exc.exit_code == 255 and "Permission denied" in exc.stderr_excerpt
+            )
+            e6_fact = ConformanceFactResult(
+                fact_id="SSH_NEG_CONTROLLER_KEY_DENIED_ROOT",
+                passed=controller_key_root_denied,
+                details=(
+                    f"exit_code={exc.exit_code}, "
+                    f"stderr={exc.stderr_excerpt.strip()[:160]}"
+                ),
+            )
+
+    try:
+        uname_res = transport.run(("uname", "-r"), timeout_sec=5.0)
+        sysd_res = transport.run(("systemctl", "--version"), timeout_sec=5.0)
+        machine_res = transport.run(("cat", "/etc/machine-id"), timeout_sec=5.0)
+    except TransportUnavailableError as exc:
+        print(f"ERROR: SSH transport unavailable: {exc}", file=sys.stderr)
+        print(
+            "Troubleshooting: see docs/lab-runbook.md (## Troubleshooting).",
+            file=sys.stderr,
+        )
+        return 2
+
+    guest_kernel = uname_res.stdout_excerpt.strip() or "unknown"
+    guest_systemd_version = (
+        sysd_res.stdout_excerpt.splitlines()[0].strip()
+        if sysd_res.stdout_excerpt.strip()
+        else "unknown"
+    )
+    raw_machine_id = machine_res.stdout_excerpt.strip()
+    guest_machine_id_sha256 = (
+        hashlib.sha256(raw_machine_id.encode("utf-8")).hexdigest()
+        if raw_machine_id
+        else None
+    )
+
+    latency_profile = measure_transport_latency(transport, samples=10)
+    latency_mux_profile = measure_transport_latency(transport_mux, samples=10)
+
+    try:
+        conf_res = root_harness.run(
+            (
+                "env",
+                "GATEHEAL_INSIDE_LAB=1",
+                "bash",
+                f"{args.guest_repo_dir}/lab/scripts/check_conformance.sh",
+            ),
+            timeout_sec=45.0,
+        )
+    except TransportUnavailableError as exc:
+        print(
+            f"ERROR: Harness transport unavailable during conformance: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Troubleshooting: see docs/lab-runbook.md (## Troubleshooting).",
+            file=sys.stderr,
+        )
+        return 2
+
+    conformance_facts = (
+        *parse_conformance_output(conf_res.stdout_excerpt),
+        e6_fact,
+    )
+    conformance_all_passed = bool(conformance_facts) and all(
+        f.passed for f in conformance_facts
+    )
+
+    smoke_results: list[SmokeScenarioRunResult] = []
+    captured_show_outputs: dict[str, dict[str, str]] = {}
+    scenarios_probes_data: dict[str, dict[str, object]] = {}
+    recording_transport = RecordingTransport(transport)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            for exp in build_wp5_smoke_expectations():
+                for repeat_idx in range(1, args.repeats + 1):
+                    _ = root_harness.run(
+                        (
+                            "env",
+                            "GATEHEAL_INSIDE_LAB=1",
+                            "bash",
+                            f"{args.guest_repo_dir}/lab/reset/reset_lab.sh",
+                        ),
+                        timeout_sec=15.0,
+                    )
+                    if exp.fault_injection_arg is not None:
+                        _ = root_harness.run(
+                            (
+                                "env",
+                                "GATEHEAL_INSIDE_LAB=1",
+                                "bash",
+                                (
+                                    f"{args.guest_repo_dir}/"
+                                    "lab/fault_injection/inject_fault.sh"
+                                ),
+                                exp.fault_injection_arg,
+                            ),
+                            timeout_sec=10.0,
+                        )
+                    if exp.scenario_id in (
+                        "S5_COLLATERAL_TRAP",
+                        "S5B_COLLATERAL_FORCED_RESTART",
+                    ):
+                        _ = root_harness.run(
+                            (
+                                "systemctl",
+                                "restart",
+                                "lab-api.service",
+                                "lab-worker.service",
+                            ),
+                            timeout_sec=10.0,
+                        )
+
+                    _ = wait_for_expected_pre_state(
+                        transport,
+                        exp.expected_pre_active_states,
+                        timeout_sec=20.0,
+                        poll_interval_sec=0.5,
+                        grace_wait_sec=5.5,
+                    )
+
+                    if repeat_idx == 1:
+                        scen_captures: dict[str, str] = {}
+                        for unit_name in cfg.inventory.services:
+                            show_r = transport.run(
+                                (
+                                    "systemctl",
+                                    "show",
+                                    unit_name,
+                                    (
+                                        "--property=ActiveState,SubState,Result,"
+                                        "NRestarts,CanReload,"
+                                        "ActiveEnterTimestampMonotonic,InvocationID,"
+                                        "ExecMainStartTimestampMonotonic"
+                                    ),
+                                ),
+                                timeout_sec=5.0,
+                            )
+                            scen_captures[unit_name] = show_r.stdout_excerpt
+                        captured_show_outputs[exp.scenario_id] = scen_captures
+
+                        uptime_r = transport.run(
+                            ("cat", "/proc/uptime"), timeout_sec=3.0
+                        )
+                        jnl_r = transport.run(
+                            (
+                                "journalctl",
+                                "-u",
+                                "lab-api.service",
+                                "-n",
+                                "20",
+                                "--no-pager",
+                                "-o",
+                                "short-monotonic",
+                            ),
+                            timeout_sec=5.0,
+                        )
+                        curl_r = transport.run(
+                            (
+                                "curl",
+                                "-sS",
+                                "-w",
+                                r" HTTP=%{http_code}",
+                                "http://127.0.0.1:8080/healthz",
+                            ),
+                            timeout_sec=5.0,
+                        )
+                        tcp_6379_r = transport.run(
+                            (
+                                "/usr/bin/python3",
+                                "-m",
+                                "gateheal.lab_daemons",
+                                "--check-tcp",
+                                "--host",
+                                "127.0.0.1",
+                                "--port",
+                                "6379",
+                            ),
+                            timeout_sec=3.0,
+                        )
+                        tcp_8081_r = transport.run(
+                            (
+                                "/usr/bin/python3",
+                                "-m",
+                                "gateheal.lab_daemons",
+                                "--check-tcp",
+                                "--host",
+                                "127.0.0.1",
+                                "--port",
+                                "8081",
+                            ),
+                            timeout_sec=3.0,
+                        )
+                        val_cfg_r = transport.run(
+                            (
+                                "/usr/bin/python3",
+                                "-m",
+                                "gateheal.lab_daemons",
+                                "--validate-config",
+                                "/etc/lab-api/config.yaml",
+                            ),
+                            timeout_sec=3.0,
+                        )
+                        scenarios_probes_data[exp.scenario_id] = {
+                            "uptime": uptime_r.stdout_excerpt,
+                            "journal_api": jnl_r.stdout_excerpt,
+                            "curl_healthz": curl_r.stdout_excerpt,
+                            "tcp_6379_exit": tcp_6379_r.exit_code,
+                            "tcp_8081_exit": tcp_8081_r.exit_code,
+                            "validate_config_exit": val_cfg_r.exit_code,
+                        }
+
+                    inc_id = f"wp5-smoke-{exp.scenario_id.lower()}-r{repeat_idx}"
+                    state_store = PersistentStateStore(tmp_dir / f"{inc_id}.json")
+                    state_store.seed_unit_state(
+                        "lab-api.service",
+                        incident_id=inc_id,
+                        prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+                        action_history=exp.seed_action_history,
+                    )
+
+                    hmac_k = (
+                        load_operator_hmac_key()
+                        or b"dev-operator-hmac-secret-key-32bytes-long!!"
+                    )
+                    approval_token = None
+                    if exp.requires_approval_token:
+                        collector = IncidentCollector(cfg)
+                        collected_inc = collector.collect_from_transport(
+                            incident_id=inc_id,
+                            target_unit="lab-api.service",
+                            transport=transport,
+                        )
+                        approval_token = mint_approval_token(
+                            token_id=f"tok-{exp.scenario_id.lower()}-{repeat_idx}",
+                            incident=collected_inc,
+                            config=cfg,
+                            action_id=ActionId.RESTART_SERVICE.value,
+                            target_unit="lab-api.service",
+                            expires_at_utc="2099-01-01T00:00:00Z",
+                            hmac_key=hmac_k,
+                        )
+
+                    recording_transport.reset_counts()
+                    orchestrator = IncidentOrchestrator(
+                        cfg,
+                        transport=recording_transport,
+                        audit_recorder=AuditRecorder(
+                            tmp_dir / f"{inc_id}_audit.jsonl"
+                        ),
+                        escalation_sink=EscalationSink(
+                            tmp_dir / f"{inc_id}_esc.jsonl"
+                        ),
+                        state_store=state_store,
+                    )
+                    if exp.requires_approval_token:
+                        orchestrator.policy_engine._hmac_key_loader = (
+                            lambda _k=hmac_k: _k
+                        )
+
+                    t_start = time.monotonic()
+                    audit = orchestrator.handle_incident(
+                        incident_id=inc_id,
+                        target_unit="lab-api.service",
+                        approval_token=approval_token,
+                    )
+                    wall_sec = round(max(0.0, time.monotonic() - t_start), 3)
+
+                    if (
+                        audit.selected_proposal is None
+                        or audit.verification_report is None
+                    ):
+                        raise RuntimeError(
+                            f"Scenario {exp.scenario_id} produced incomplete audit."
+                        )
+
+                    sel = audit.selected_proposal
+                    ver = audit.verification_report
+                    mut_exec = recording_transport.mutating_commands_executed
+                    total_cmds = recording_transport.ssh_command_count
+
+                    matched = (
+                        audit.diagnosis.fault_class in exp.expected_fault_classes
+                        and sel.action_id == exp.expected_action_id.value
+                        and sel.target_unit == exp.expected_target_unit
+                        and ver.status == exp.expected_verification_status
+                        and ver.collateral_failures == exp.expected_collateral_failures
+                        and audit.escalated == exp.expected_escalated
+                        and mut_exec == exp.expected_mutating_commands
+                    )
+                    budget_ok = wall_sec < cfg.budgets.total_incident_timeout_sec
+
+                    smoke_results.append(
+                        SmokeScenarioRunResult(
+                            scenario_id=exp.scenario_id,
+                            repeat_index=repeat_idx,
+                            diagnosed_fault=audit.diagnosis.fault_class,
+                            selected_action_id=sel.action_id,
+                            selected_target_unit=sel.target_unit,
+                            verification_status=ver.status,
+                            collateral_failures=ver.collateral_failures,
+                            samples_collected=ver.samples_collected,
+                            soak_wall_clock_sec=wall_sec,
+                            soak_budget_ok=budget_ok,
+                            ssh_command_count=total_cmds,
+                            mutating_commands_executed=mut_exec,
+                            escalated=audit.escalated,
+                            matched_expectation=matched,
+                        )
+                    )
+    except TransportUnavailableError as exc:
+        print(
+            f"ERROR: Transport unavailable during smoke execution: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Troubleshooting: see docs/lab-runbook.md (## Troubleshooting).",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        try:
+            _ = root_harness.run(
+                (
+                    "env",
+                    "GATEHEAL_INSIDE_LAB=1",
+                    "bash",
+                    f"{args.guest_repo_dir}/lab/reset/reset_lab.sh",
+                ),
+                timeout_sec=15.0,
+            )
+        except TransportUnavailableError:
+            pass
+
+    default_vm_dir = str(Path.home() / ".cache" / "gateheal-vm")
+    vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", default_vm_dir))
+    release_file = vm_dir / "base_image_release"
+    pin_file = vm_dir / "base.pin"
+    recorded_release = (
+        release_file.read_text(encoding="utf-8").strip()
+        if release_file.is_file()
+        else DEFAULT_PINNED_UBUNTU_RELEASE
+    )
+    recorded_upstream_sha: str | None = None
+    if pin_file.is_file():
+        pin_tokens = pin_file.read_text(encoding="utf-8").split()
+        if pin_tokens:
+            recorded_upstream_sha = pin_tokens[-1].strip()
+
+    manifest = build_lab_run_manifest(
+        repo_root=repo_root,
+        config_path=args.config,
+        sudoers_path=repo_root / "lab" / "systemd" / "gateheal-sudoers.conf",
+        ssh_latency=latency_profile,
+        ssh_latency_multiplexed=latency_mux_profile,
+        conformance_facts=conformance_facts,
+        smoke_matrix=smoke_results,
+        guest_kernel=guest_kernel,
+        guest_systemd_version=guest_systemd_version,
+        guest_machine_id_sha256=guest_machine_id_sha256,
+        controller_key_root_login_denied=controller_key_root_denied,
+        base_image_release=recorded_release or DEFAULT_PINNED_UBUNTU_RELEASE,
+        base_image_upstream_sha256=recorded_upstream_sha,
+        base_image_path=vm_dir / "ubuntu-24.04-base.qcow2",
+        overlay_image_path=vm_dir / "lab-overlay.qcow2",
+        repeats=args.repeats,
+    )
+
+    args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
+    args.manifest_out.write_text(
+        manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
+
+    if conformance_all_passed:
+        fixture_payload = {
+            "fixture_version": 2,
+            "capture_source": "LIVE_QEMU_KVM_GUEST",
+            "capture_id": uuid.uuid4().hex,
+            "captured_at_utc": manifest.generated_at_utc,
+            "guest_kernel": guest_kernel,
+            "guest_systemd_version": guest_systemd_version,
+            "guest_machine_id_sha256": guest_machine_id_sha256,
+            "conformance_facts": [f.model_dump() for f in conformance_facts],
+            "scenarios_systemctl_show": captured_show_outputs,
+            "scenarios_probes": scenarios_probes_data,
+        }
+        args.fixtures_out.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_fix_path = tempfile.mkstemp(
+            dir=str(args.fixtures_out.parent), text=True
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tf:
+                json.dump(fixture_payload, tf, indent=2)
+                tf.write("\n")
+            os.replace(tmp_fix_path, args.fixtures_out)
+        finally:
+            if os.path.exists(tmp_fix_path):
+                try:
+                    os.unlink(tmp_fix_path)
+                except OSError:
+                    pass
+
+    print(manifest.model_dump_json(indent=2))
+    return 0 if (manifest.conformance_all_passed and manifest.smoke_all_passed) else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except TransportUnavailableError as exc:
+        print(
+            f"ERROR: SSH failed ({exc}). Troubleshooting: see docs/lab-runbook.md.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 ````
 
 ## File: lab/systemd/lab-worker.service
@@ -8664,6 +8252,484 @@ def compute_campaign_metrics(
     )
 ````
 
+## File: src/gateheal/lab_bringup.py
+````python
+"""WP5 real-lab conformance parser, SSH latency profiler, S0-S5B smoke matrix, and manifest."""
+
+from __future__ import annotations
+
+import hashlib
+import statistics
+import subprocess
+import time
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from gateheal.collector import parse_systemctl_show
+from gateheal.models import ActionId, FaultClass, VerificationStatus
+from gateheal.transport import CommandTransport
+
+DEFAULT_PINNED_UBUNTU_RELEASE = "release-20250219"
+
+
+class ConformanceFactResult(BaseModel):
+    """Single parsed PASS/FAIL line from `lab/scripts/check_conformance.sh`."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    fact_id: str
+    passed: bool
+    details: str
+
+
+class SSHLatencyProfile(BaseModel):
+    """Measured SSH command round-trip latency statistics in milliseconds."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    samples: Annotated[int, Field(ge=1)]
+    min_ms: Annotated[float, Field(ge=0.0)]
+    mean_ms: Annotated[float, Field(ge=0.0)]
+    p95_ms: Annotated[float, Field(ge=0.0)]
+    max_ms: Annotated[float, Field(ge=0.0)]
+
+
+class SmokeMatrixExpectation(BaseModel):
+    """Expected controller decision and verification outcome for a live lab scenario."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    scenario_id: str
+    fault_injection_arg: str | None
+    seed_prior_recovery_attempts: int = 0
+    seed_action_history: tuple[str, ...] = ()
+    requires_approval_token: bool = False
+    expected_pre_active_states: dict[str, str] = Field(
+        default_factory=lambda: {
+            "lab-redis.service": "active",
+            "lab-api.service": "active",
+            "lab-worker.service": "active",
+        }
+    )
+    expected_fault_classes: tuple[FaultClass, ...]
+    expected_action_id: ActionId
+    expected_target_unit: str
+    expected_verification_status: VerificationStatus
+    expected_collateral_failures: tuple[str, ...] = ()
+    expected_escalated: bool
+    expected_mutating_commands: int = 1
+
+
+class SmokeScenarioRunResult(BaseModel):
+    """Recorded live execution result for a single S0-S5B smoke scenario run."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    scenario_id: str
+    repeat_index: int = 1
+    diagnosed_fault: FaultClass
+    selected_action_id: str
+    selected_target_unit: str | None
+    verification_status: VerificationStatus
+    collateral_failures: tuple[str, ...] = ()
+    samples_collected: int
+    soak_wall_clock_sec: float
+    soak_budget_ok: bool = True
+    ssh_command_count: int = 0
+    mutating_commands_executed: int = 0
+    escalated: bool
+    matched_expectation: bool
+
+
+class LabRunManifest(BaseModel):
+    """Machine-readable WP5 lab bring-up and verification manifest."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: str = "1.0"
+    generated_at_utc: str
+    git_sha: str
+    git_dirty: bool
+    config_sha256: str
+    sudoers_sha256: str
+    base_image_release: str = DEFAULT_PINNED_UBUNTU_RELEASE
+    base_image_sha256: str | None = None
+    base_image_upstream_sha256: str | None = None
+    overlay_image_sha256: str | None = None
+    guest_kernel: str = "unknown"
+    guest_systemd_version: str = "unknown"
+    guest_machine_id_sha256: str | None = None
+    controller_key_root_login_denied: bool = False
+    nrestarts_manual_restart_observation: str = "unknown"
+    ssh_latency: SSHLatencyProfile
+    ssh_latency_multiplexed: SSHLatencyProfile | None = None
+    conformance_facts: tuple[ConformanceFactResult, ...]
+    conformance_all_passed: bool
+    repeats: int = 1
+    flake_count: int = 0
+    soak_budget_ok: bool = True
+    smoke_matrix: tuple[SmokeScenarioRunResult, ...]
+    smoke_all_passed: bool
+
+
+def compute_file_sha256(path: Path) -> str:
+    """Compute hex SHA-256 digest of a file on disk."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def resolve_git_revision(repo_root: Path) -> tuple[str, bool]:
+    """Return (git_commit_sha, is_working_tree_dirty) for repo_root."""
+    try:
+        sha_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root.resolve()),
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+        sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else "unknown"
+        status_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_root.resolve()),
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+        dirty = bool(status_proc.stdout.strip())
+        return sha or "unknown", dirty
+    except OSError:
+        return "unknown", False
+
+
+def parse_conformance_output(raw_stdout: str) -> tuple[ConformanceFactResult, ...]:
+    """Parse PASS/FAIL lines emitted by `lab/scripts/check_conformance.sh`."""
+    results: list[ConformanceFactResult] = []
+    for raw_line in raw_stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("PASS: ") or line.startswith("FAIL: "):
+            passed = line.startswith("PASS: ")
+            body = line[6:]
+            if " :: " in body:
+                fact_id, details = body.split(" :: ", 1)
+            else:
+                fact_id, details = body, ""
+            results.append(
+                ConformanceFactResult(
+                    fact_id=fact_id.strip(),
+                    passed=passed,
+                    details=details.strip(),
+                )
+            )
+    return tuple(results)
+
+
+def extract_nrestarts_observation(
+    conformance_facts: Sequence[ConformanceFactResult],
+) -> str:
+    """Extract `observed=<preserved|reset>` from FACT_5B_MANUAL_RESTART_NRESTARTS."""
+    for fact in conformance_facts:
+        if fact.fact_id == "FACT_5B_MANUAL_RESTART_NRESTARTS":
+            for token in fact.details.split():
+                if token.startswith("observed="):
+                    val = token.split("=", 1)[1].strip()
+                    if val:
+                        return val
+    return "unknown"
+
+
+def measure_transport_latency(
+    transport: CommandTransport,
+    *,
+    samples: int = 10,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+) -> SSHLatencyProfile:
+    """Measure round-trip execution latency over transport in milliseconds."""
+    if samples < 1:
+        raise ValueError("samples must be >= 1")
+    durations_ms: list[float] = []
+    for _ in range(samples):
+        t0 = monotonic_clock()
+        res = transport.run(("systemctl", "--version"), timeout_sec=5.0)
+        elapsed_ms = max(0.0, (monotonic_clock() - t0) * 1000.0)
+        if res.timed_out or res.exit_code != 0:
+            raise RuntimeError(
+                f"Transport latency probe failed (exit={res.exit_code}, "
+                f"timed_out={res.timed_out})."
+            )
+        durations_ms.append(elapsed_ms)
+
+    sorted_ms = sorted(durations_ms)
+    p95_idx = min(len(sorted_ms) - 1, max(0, int(round(0.95 * (len(sorted_ms) - 1)))))
+    return SSHLatencyProfile(
+        samples=samples,
+        min_ms=round(sorted_ms[0], 3),
+        mean_ms=round(statistics.fmean(sorted_ms), 3),
+        p95_ms=round(sorted_ms[p95_idx], 3),
+        max_ms=round(sorted_ms[-1], 3),
+    )
+
+
+def wait_for_expected_pre_state(
+    transport: CommandTransport,
+    expected_active_states: dict[str, str],
+    *,
+    timeout_sec: float = 20.0,
+    poll_interval_sec: float = 0.5,
+    grace_wait_sec: float = 5.5,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> float:
+    """Poll until all units reach their expected pre-state, then sleep grace_wait_sec."""
+    start = monotonic_clock()
+    last_observed: dict[str, str] = {}
+
+    while True:
+        all_matched = True
+        for unit_name, expected_state in expected_active_states.items():
+            res = transport.run(
+                ("systemctl", "show", unit_name, "--property=ActiveState,SubState"),
+                timeout_sec=5.0,
+            )
+            props = parse_systemctl_show(res.stdout_excerpt)
+            actual_state = props.get("ActiveState", "unknown").strip()
+            last_observed[unit_name] = actual_state
+            if actual_state != expected_state:
+                all_matched = False
+
+        if all_matched:
+            if grace_wait_sec > 0.0:
+                sleep_fn(grace_wait_sec)
+            return max(0.0, monotonic_clock() - start)
+
+        if monotonic_clock() - start >= timeout_sec:
+            raise RuntimeError(
+                f"Timed out after {timeout_sec}s waiting for expected unit "
+                f"pre-states {expected_active_states}; last_observed={last_observed}"
+            )
+        sleep_fn(poll_interval_sec)
+
+
+def build_wp5_smoke_expectations() -> tuple[SmokeMatrixExpectation, ...]:
+    """Return the canonical 7-scenario S0-S5B smoke matrix expectations for WP5."""
+    return (
+        SmokeMatrixExpectation(
+            scenario_id="S0_HEALTHY_CONTROL",
+            fault_injection_arg=None,
+            expected_pre_active_states={
+                "lab-redis.service": "active",
+                "lab-api.service": "active",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(FaultClass.HEALTHY,),
+            expected_action_id=ActionId.NO_OP,
+            expected_target_unit="lab-api.service",
+            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
+            expected_collateral_failures=(),
+            expected_escalated=False,
+            expected_mutating_commands=0,
+        ),
+        SmokeMatrixExpectation(
+            scenario_id="S1_SERVICE_CRASH",
+            fault_injection_arg="S1_SERVICE_CRASH",
+            expected_pre_active_states={
+                "lab-redis.service": "active",
+                "lab-api.service": "failed",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(FaultClass.PROCESS_CRASH,),
+            expected_action_id=ActionId.RESTART_SERVICE,
+            expected_target_unit="lab-api.service",
+            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
+            expected_collateral_failures=(),
+            expected_escalated=False,
+            expected_mutating_commands=1,
+        ),
+        SmokeMatrixExpectation(
+            scenario_id="S2_INVALID_CONFIG",
+            fault_injection_arg="S2_INVALID_CONFIG",
+            expected_pre_active_states={
+                "lab-redis.service": "active",
+                "lab-api.service": "active",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(FaultClass.INVALID_CONFIG,),
+            expected_action_id=ActionId.ABSTAIN_AND_ESCALATE,
+            expected_target_unit="lab-api.service",
+            expected_verification_status=VerificationStatus.FAULT_PERSISTS_SERVICE_UP,
+            expected_collateral_failures=(),
+            expected_escalated=True,
+            expected_mutating_commands=0,
+        ),
+        SmokeMatrixExpectation(
+            scenario_id="S3_DEPENDENCY_FAILURE",
+            fault_injection_arg="S3_DEPENDENCY_FAILURE",
+            expected_pre_active_states={
+                "lab-redis.service": "failed",
+                "lab-api.service": "active",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(FaultClass.DEPENDENCY_FAILURE,),
+            expected_action_id=ActionId.RESTART_SERVICE,
+            expected_target_unit="lab-redis.service",
+            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
+            expected_collateral_failures=(),
+            expected_escalated=False,
+            expected_mutating_commands=1,
+        ),
+        SmokeMatrixExpectation(
+            scenario_id="S4_PERSISTENT_FAILURE",
+            fault_injection_arg="S4_PERSISTENT_FAILURE",
+            seed_prior_recovery_attempts=1,
+            seed_action_history=("restart_service:lab-api.service",),
+            expected_pre_active_states={
+                "lab-redis.service": "active",
+                "lab-api.service": "failed",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(
+                FaultClass.PERSISTENT_FAILURE,
+                FaultClass.INVALID_CONFIG,
+            ),
+            expected_action_id=ActionId.ABSTAIN_AND_ESCALATE,
+            expected_target_unit="lab-api.service",
+            expected_verification_status=VerificationStatus.NOT_RECOVERED,
+            expected_collateral_failures=(),
+            expected_escalated=True,
+            expected_mutating_commands=0,
+        ),
+        SmokeMatrixExpectation(
+            scenario_id="S5_COLLATERAL_TRAP",
+            fault_injection_arg="S5_COLLATERAL_TRAP",
+            expected_pre_active_states={
+                "lab-redis.service": "active",
+                "lab-api.service": "active",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(FaultClass.DEGRADED_RUNNING,),
+            expected_action_id=ActionId.RELOAD_SERVICE,
+            expected_target_unit="lab-api.service",
+            expected_verification_status=VerificationStatus.RECOVERED_CLEAN,
+            expected_collateral_failures=(),
+            expected_escalated=False,
+            expected_mutating_commands=1,
+        ),
+        SmokeMatrixExpectation(
+            scenario_id="S5B_COLLATERAL_FORCED_RESTART",
+            fault_injection_arg="S5_COLLATERAL_TRAP",
+            seed_prior_recovery_attempts=1,
+            seed_action_history=("reload_service:lab-api.service",),
+            requires_approval_token=True,
+            expected_pre_active_states={
+                "lab-redis.service": "active",
+                "lab-api.service": "active",
+                "lab-worker.service": "active",
+            },
+            expected_fault_classes=(FaultClass.DEGRADED_RUNNING,),
+            expected_action_id=ActionId.RESTART_SERVICE,
+            expected_target_unit="lab-api.service",
+            expected_verification_status=(
+                VerificationStatus.RECOVERED_WITH_COLLATERAL_FAILURE
+            ),
+            expected_collateral_failures=("lab-worker.service",),
+            expected_escalated=True,
+            expected_mutating_commands=1,
+        ),
+    )
+
+
+def _default_utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def build_lab_run_manifest(
+    *,
+    repo_root: Path,
+    config_path: Path,
+    sudoers_path: Path,
+    ssh_latency: SSHLatencyProfile,
+    ssh_latency_multiplexed: SSHLatencyProfile | None = None,
+    conformance_facts: Sequence[ConformanceFactResult],
+    smoke_matrix: Sequence[SmokeScenarioRunResult],
+    guest_kernel: str = "unknown",
+    guest_systemd_version: str = "unknown",
+    guest_machine_id_sha256: str | None = None,
+    controller_key_root_login_denied: bool = False,
+    nrestarts_manual_restart_observation: str | None = None,
+    base_image_release: str = DEFAULT_PINNED_UBUNTU_RELEASE,
+    base_image_upstream_sha256: str | None = None,
+    base_image_path: Path | None = None,
+    overlay_image_path: Path | None = None,
+    repeats: int = 1,
+    clock_utc: Callable[[], datetime] | None = None,
+) -> LabRunManifest:
+    """Construct a validated LabRunManifest with git SHA and artifact hashes."""
+    now_fn: Callable[[], datetime] = (
+        _default_utc_now if clock_utc is None else clock_utc
+    )
+    git_sha, git_dirty = resolve_git_revision(repo_root)
+    cfg_hash = compute_file_sha256(config_path)
+    sudo_hash = compute_file_sha256(sudoers_path)
+    base_hash = (
+        compute_file_sha256(base_image_path)
+        if base_image_path is not None and base_image_path.is_file()
+        else None
+    )
+    ovl_hash = (
+        compute_file_sha256(overlay_image_path)
+        if overlay_image_path is not None and overlay_image_path.is_file()
+        else None
+    )
+    facts_tuple = tuple(conformance_facts)
+    smoke_tuple = tuple(smoke_matrix)
+    flake_count = sum(1 for s in smoke_tuple if not s.matched_expectation)
+    all_soak_budget_ok = bool(smoke_tuple) and all(
+        s.soak_budget_ok for s in smoke_tuple
+    )
+    observed_d4 = (
+        extract_nrestarts_observation(facts_tuple)
+        if nrestarts_manual_restart_observation is None
+        else nrestarts_manual_restart_observation
+    )
+    return LabRunManifest(
+        generated_at_utc=now_fn().isoformat(),
+        git_sha=git_sha,
+        git_dirty=git_dirty,
+        config_sha256=cfg_hash,
+        sudoers_sha256=sudo_hash,
+        base_image_release=base_image_release,
+        base_image_upstream_sha256=base_image_upstream_sha256,
+        base_image_sha256=base_hash,
+        overlay_image_sha256=ovl_hash,
+        guest_kernel=guest_kernel,
+        guest_systemd_version=guest_systemd_version,
+        guest_machine_id_sha256=guest_machine_id_sha256,
+        controller_key_root_login_denied=controller_key_root_login_denied,
+        nrestarts_manual_restart_observation=observed_d4,
+        ssh_latency=ssh_latency,
+        ssh_latency_multiplexed=ssh_latency_multiplexed,
+        conformance_facts=facts_tuple,
+        conformance_all_passed=bool(facts_tuple)
+        and all(f.passed for f in facts_tuple),
+        repeats=repeats,
+        flake_count=flake_count,
+        soak_budget_ok=all_soak_budget_ok,
+        smoke_matrix=smoke_tuple,
+        smoke_all_passed=bool(smoke_tuple)
+        and flake_count == 0
+        and all_soak_budget_ok,
+    )
+````
+
 ## File: src/gateheal/lab_daemons.py
 ````python
 """Self-contained Linux lab service daemons and config validator for GateHeal."""
@@ -10735,565 +10801,6 @@ def test_live_collector_parses_systemctl_invocation_id_and_three_valued_config_c
     assert incident_timeout.services["lab-api.service"].config_valid is None
 ````
 
-## File: tests/lab/test_wp5_collector_on_real_fixtures.py
-````python
-"""F3: Offline test on real captured VM fixtures using IncidentCollector plus DiagnosisEngine."""
-
-from __future__ import annotations
-
-import json
-from collections.abc import Sequence
-from pathlib import Path
-
-import pytest
-
-from gateheal.collector import IncidentCollector, parse_systemctl_show
-from gateheal.config import load_config
-from gateheal.diagnosis import DiagnosisEngine
-from gateheal.models import FaultClass
-from gateheal.transport import TransportResult
-
-pytestmark = pytest.mark.lab
-
-
-class _FixtureCommandTransport:
-    """Transport keyed by argv returning captured raw outputs from real VM fixtures."""
-
-    def __init__(self, shows: dict[str, str], probes: dict[str, object] | None = None) -> None:
-        self._shows = shows
-        self._probes = probes or {}
-
-    def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
-        _ = timeout_sec
-        cmd = tuple(argv)
-        if cmd[:2] == ("cat", "/proc/uptime"):
-            return TransportResult(
-                exit_code=0,
-                duration_sec=0.01,
-                stdout_excerpt=str(self._probes.get("uptime", "50000.0 40000.0\n")),
-            )
-        if cmd[:2] == ("systemctl", "show"):
-            u = cmd[2]
-            excerpt = self._shows.get(u, "")
-            return TransportResult(
-                exit_code=0,
-                duration_sec=0.01,
-                stdout_excerpt=str(excerpt),
-            )
-        if "--validate-config" in cmd:
-            return TransportResult(
-                exit_code=int(self._probes.get("validate_config_exit", 0)),
-                duration_sec=0.01,
-            )
-        if cmd[0] == "curl":
-            return TransportResult(
-                exit_code=0 if "200" in str(self._probes.get("curl_healthz", "")) else 22,
-                duration_sec=0.01,
-                stdout_excerpt=str(self._probes.get("curl_healthz", "")),
-            )
-        if "--check-tcp" in cmd:
-            port = cmd[-1]
-            code = (
-                int(self._probes.get("tcp_6379_exit", 0))
-                if port == "6379"
-                else int(self._probes.get("tcp_8081_exit", 0))
-            )
-            return TransportResult(exit_code=code, duration_sec=0.01)
-        return TransportResult(exit_code=0, duration_sec=0.01)
-
-
-def test_wp5_collector_on_real_fixtures() -> None:
-    """F3: Feed captured VM outputs via IncidentCollector.collect_from_transport."""
-    repo_root = Path(__file__).resolve().parents[2]
-    cfg = load_config(repo_root / "configs" / "phase1_lab.yaml")
-    fixture_path = repo_root / "tests" / "lab" / "fixtures" / "vm_captured_systemd_facts.json"
-    assert fixture_path.is_file()
-
-    payload = json.loads(fixture_path.read_text(encoding="utf-8"))
-    scen_shows = payload.get("scenarios_systemctl_show", {})
-    scen_probes = payload.get("scenarios_probes", {})
-    assert isinstance(scen_shows, dict)
-
-    expected_fault_classes = {
-        "S0_HEALTHY_CONTROL": FaultClass.HEALTHY,
-        "S1_SERVICE_CRASH": FaultClass.PROCESS_CRASH,
-        "S2_INVALID_CONFIG": FaultClass.INVALID_CONFIG,
-        "S3_DEPENDENCY_FAILURE": FaultClass.DEPENDENCY_FAILURE,
-        "S4_PERSISTENT_FAILURE": FaultClass.PROCESS_CRASH,
-        "S5_COLLATERAL_TRAP": FaultClass.DEGRADED_RUNNING,
-        "S5B_COLLATERAL_FORCED_RESTART": FaultClass.DEGRADED_RUNNING,
-    }
-
-    collector = IncidentCollector(cfg)
-    diagnosis_engine = DiagnosisEngine(cfg)
-
-    for scen_id, expected_fault in expected_fault_classes.items():
-        if scen_id not in scen_shows:
-            pytest.skip(f"Fixture lacks captured systemctl show output for scenario {scen_id}")
-
-        unit_map = scen_shows[scen_id]
-        probes = scen_probes.get(scen_id, {})
-        assert isinstance(unit_map, dict)
-
-        transport = _FixtureCommandTransport(unit_map, probes)
-        target_unit = "lab-api.service" if scen_id != "S3_DEPENDENCY_FAILURE" else "lab-redis.service"
-
-        incident = collector.collect_from_transport(
-            incident_id=f"replay-{scen_id.lower()}",
-            target_unit=target_unit,
-            transport=transport,
-        )
-        diag = diagnosis_engine.diagnose(incident)
-        assert diag.fault_class == expected_fault, (
-            f"Scenario {scen_id} diagnosed {diag.fault_class}, expected {expected_fault}"
-        )
-````
-
-## File: tests/lab/test_wp5_real_lab.py
-````python
-"""WP5 real-lab conformance, sudoers negative, latency/soak, S0-S5B smoke, and manifest tests."""
-
-from __future__ import annotations
-
-import json
-import os
-import shlex
-from collections.abc import Sequence
-from datetime import UTC, datetime
-from pathlib import Path
-
-import pytest
-
-from gateheal.collector import (
-    IncidentCollector,
-    parse_invocation_and_start_usec,
-    parse_systemctl_show,
-)
-from gateheal.config import GateHealConfig, load_config
-from gateheal.controller import AuditRecorder, EscalationSink
-from gateheal.lab_bringup import (
-    LabRunManifest,
-    SmokeScenarioRunResult,
-    build_lab_run_manifest,
-    build_wp5_smoke_expectations,
-    measure_transport_latency,
-    parse_conformance_output,
-)
-from gateheal.models import ActionId, ServiceEvidence
-from gateheal.orchestrator import IncidentOrchestrator
-from gateheal.state import PersistentStateStore
-from gateheal.transport import (
-    SSHLabTransport,
-    TransportResult,
-    TransportUnavailableError,
-)
-
-pytestmark = pytest.mark.lab
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _load_cfg() -> GateHealConfig:
-    return load_config(_repo_root() / "configs" / "phase1_lab.yaml")
-
-
-def _load_fixture_json() -> dict[str, object]:
-    fix_path = (
-        Path(__file__).resolve().parent
-        / "fixtures"
-        / "vm_captured_systemd_facts.json"
-    )
-    raw = json.loads(fix_path.read_text(encoding="utf-8"))
-    assert isinstance(raw, dict)
-    return raw
-
-
-class _FixtureReplayTransport:
-    """Scripted offline replay transport using VM-captured `systemctl show` fixtures."""
-
-    def __init__(self, shows: dict[str, object], scen: str) -> None:
-        self._shows = shows
-        self._scen = scen
-        self.mutated = False
-
-    def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
-        _ = timeout_sec
-        cmd = tuple(argv)
-        if cmd[:2] == ("cat", "/proc/uptime"):
-            return TransportResult(
-                exit_code=0,
-                duration_sec=0.01,
-                stdout_excerpt="50000.0 40000.0\n",
-            )
-        if cmd[:3] == ("sudo", "-n", "/usr/bin/systemctl"):
-            self.mutated = True
-            return TransportResult(exit_code=0, duration_sec=0.02)
-        if cmd[:2] == ("systemctl", "show"):
-            u = cmd[2]
-            if (
-                self.mutated
-                and self._scen != "S5_COLLATERAL_TRAP"
-                and self._scen != "S5B_COLLATERAL_FORCED_RESTART"
-            ):
-                return TransportResult(
-                    exit_code=0,
-                    duration_sec=0.01,
-                    stdout_excerpt=(
-                        "ActiveState=active\nSubState=running\nResult=success\n"
-                        "NRestarts=0\nCanReload=yes\n"
-                        "ActiveEnterTimestampMonotonic=50000000\n"
-                        "InvocationID=ddddeeeeffff00001111222233334444\n"
-                        "ExecMainStartTimestampMonotonic=45000000\n"
-                    ),
-                )
-            if (
-                self._scen == "S5B_COLLATERAL_FORCED_RESTART"
-                and u == "lab-worker.service"
-                and self.mutated
-            ):
-                return TransportResult(
-                    exit_code=0,
-                    duration_sec=0.01,
-                    stdout_excerpt=(
-                        "ActiveState=failed\nSubState=failed\nResult=exit-code\n"
-                        "NRestarts=0\nCanReload=no\n"
-                        "ActiveEnterTimestampMonotonic=10000000\n"
-                        "InvocationID=workerold1111\n"
-                        "ExecMainStartTimestampMonotonic=10000000\n"
-                    ),
-                )
-            return TransportResult(
-                exit_code=0,
-                duration_sec=0.01,
-                stdout_excerpt=str(self._shows.get(u, "")),
-            )
-        if "--validate-config" in cmd:
-            is_bad_cfg = self._scen in (
-                "S2_INVALID_CONFIG",
-                "S4_PERSISTENT_FAILURE",
-            )
-            return TransportResult(
-                exit_code=65 if is_bad_cfg else 0,
-                duration_sec=0.01,
-            )
-        if cmd[0] == "curl":
-            if self.mutated or self._scen in (
-                "S2_INVALID_CONFIG",
-                "S0_HEALTHY_CONTROL",
-            ):
-                return TransportResult(exit_code=0, duration_sec=0.01)
-            return TransportResult(exit_code=22, duration_sec=0.01)
-        if "--check-tcp" in cmd:
-            port = cmd[-1]
-            if (
-                port == "6379"
-                and self._scen == "S3_DEPENDENCY_FAILURE"
-                and not self.mutated
-            ):
-                return TransportResult(exit_code=1, duration_sec=0.01)
-            return TransportResult(exit_code=0, duration_sec=0.01)
-        return TransportResult(exit_code=0, duration_sec=0.01)
-
-
-def test_wp5_conformance_script_and_fixture_facts_cover_all_systemd_invariants() -> None:
-    """Verify check_conformance.sh and captured fixture cover all systemd facts + sudoers."""
-    script_path = _repo_root() / "lab" / "scripts" / "check_conformance.sh"
-    assert script_path.is_file()
-    script_text = script_path.read_text(encoding="utf-8")
-
-    required_script_ids = (
-        "FACT_1_RESTART_NO_NRESTARTS_ZERO",
-        "FACT_2_INVOCATION_ID_RESTART_VS_RELOAD",
-        "FACT_3_SIGKILL_RESULT_SIGNAL",
-        "FACT_4A_ACTIVE_API_RESTART_KILLS_WORKER",
-        "FACT_4B_START_FAILED_API_PRESERVES_WORKER",
-        "FACT_5B_MANUAL_RESTART_NRESTARTS",
-        "SUDO_POS_RELOAD_API",
-        "SUDO_POS_RESTART_REDIS",
-        "SUDO_POS_RESTART_API",
-        "SUDO_POS_RESTART_WORKER",
-        "SUDO_NEG_DENIED",
-        "FACT_6_UBUNTU_UNPRIVILEGED_READS",
-        "FACT_7_EXECSTARTPRE_FAILURE",
-    )
-    for fact_id in required_script_ids:
-        assert fact_id in script_text
-
-
-def test_wp5_sudoers_negative_commands_are_strictly_outside_allowlist() -> None:
-    """Verify every negative and argument-injection command is rejected by sudoers."""
-    sudoers_path = _repo_root() / "lab" / "systemd" / "gateheal-sudoers.conf"
-    prefix = "ubuntu ALL=(root) NOPASSWD: "
-    allowed_tuples = {
-        tuple(shlex.split(ln.strip()[len(prefix) :]))
-        for ln in sudoers_path.read_text(encoding="utf-8").splitlines()
-        if ln.strip().startswith(prefix)
-    }
-    assert len(allowed_tuples) == 4
-
-    denied_candidates = (
-        ("/usr/bin/systemctl", "stop", "lab-api.service"),
-        ("/usr/bin/systemctl", "reload", "lab-redis.service"),
-        ("/usr/bin/systemctl", "reload", "lab-worker.service"),
-        ("/usr/bin/systemctl", "restart", "ssh.service"),
-        ("/usr/bin/systemctl", "daemon-reload"),
-        ("/bin/sh", "-c", "id"),
-        ("/usr/bin/systemctl", "restart", "lab-api.service", "ssh.service"),
-        ("/usr/bin/systemctl", "restart", "lab-api.service", "--no-block"),
-        ("/usr/bin/systemctl", "restart", "lab-api.service", "lab-redis.service"),
-        ("/usr/bin/systemctl", "--no-block", "restart", "lab-api.service"),
-        ("/usr/bin/systemctl", "restart", "lab-api.service", "--", "--version"),
-    )
-    for candidate in denied_candidates:
-        assert candidate not in allowed_tuples
-
-
-def test_wp5_latency_profiler_and_manifest_builder_with_captured_fixtures(
-    tmp_path: Path,
-) -> None:
-    """Scripted offline replay: verify latency profiler, S0-S5B fixture replay, and manifest."""
-    repo_root = _repo_root()
-    cfg = _load_cfg()
-    fixture = _load_fixture_json()
-    scen_map = fixture["scenarios_systemctl_show"]
-    assert isinstance(scen_map, dict)
-
-    clock_ticks = [0.0]
-
-    def fake_clock() -> float:
-        clock_ticks[0] += 0.012
-        return clock_ticks[0]
-
-    class _FastTransport:
-        def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
-            _ = (argv, timeout_sec)
-            return TransportResult(
-                exit_code=0,
-                duration_sec=0.01,
-                stdout_excerpt="systemd 255\n",
-            )
-
-    latency = measure_transport_latency(
-        _FastTransport(), samples=10, monotonic_clock=fake_clock
-    )
-    assert latency.samples == 10
-    assert latency.min_ms == pytest.approx(12.0)
-    assert latency.p95_ms == pytest.approx(12.0)
-
-    smoke_runs: list[SmokeScenarioRunResult] = []
-    now_dt = datetime(2026, 10, 24, 8, 0, 0, tzinfo=UTC)
-
-    for exp in build_wp5_smoke_expectations():
-        unit_shows = scen_map.get(
-            exp.scenario_id, scen_map.get("S1_SERVICE_CRASH", {})
-        )
-        assert isinstance(unit_shows, dict)
-        soak_step = [0]
-
-        def _mono(_s: list[int] = soak_step) -> float:
-            return float(_s[0])
-
-        def _sleep(sec: float, _s: list[int] = soak_step) -> None:
-            _s[0] += int(sec)
-
-        inc_id = f"wp5-replay-{exp.scenario_id.lower()}"
-        store = PersistentStateStore(tmp_path / f"{inc_id}.json")
-        store.seed_unit_state(
-            "lab-api.service",
-            incident_id=inc_id,
-            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
-            action_history=exp.seed_action_history,
-        )
-        approval_token = None
-        if exp.requires_approval_token:
-            from gateheal.policy import mint_approval_token
-
-            collector = IncidentCollector(cfg)
-            dummy_inc = collector.collect_simulated(
-                incident_id=inc_id,
-                target_unit="lab-api.service",
-                simulated_services={
-                    "lab-redis.service": ServiceEvidence(
-                        unit_name="lab-redis.service",
-                        active_state="active",
-                        sub_state="running",
-                        health_probe_ok=True,
-                        config_valid=True,
-                    ),
-                    "lab-api.service": ServiceEvidence(
-                        unit_name="lab-api.service",
-                        active_state="active",
-                        sub_state="running",
-                        health_probe_ok=True,
-                        config_valid=True,
-                    ),
-                    "lab-worker.service": ServiceEvidence(
-                        unit_name="lab-worker.service",
-                        active_state="active",
-                        sub_state="running",
-                        health_probe_ok=True,
-                        config_valid=True,
-                    ),
-                },
-            )
-            approval_token = mint_approval_token(
-                token_id="tok-replay",
-                incident=dummy_inc,
-                config=cfg,
-                action_id=ActionId.RESTART_SERVICE.value,
-                target_unit="lab-api.service",
-                expires_at_utc="2099-01-01T00:00:00Z",
-                hmac_key=b"dev-operator-hmac-secret-key-32bytes-long!!",
-            )
-
-        orch = IncidentOrchestrator(
-            cfg,
-            transport=_FixtureReplayTransport(unit_shows, exp.scenario_id),
-            audit_recorder=AuditRecorder(
-                tmp_path / f"{inc_id}_audit.jsonl", clock_utc=lambda: now_dt
-            ),
-            escalation_sink=EscalationSink(tmp_path / f"{inc_id}_esc.jsonl"),
-            state_store=store,
-            clock_utc=lambda: now_dt,
-            monotonic_clock=_mono,
-            sleep_fn=_sleep,
-        )
-        audit = orch.handle_incident(
-            incident_id=inc_id,
-            target_unit="lab-api.service",
-            approval_token=approval_token,
-        )
-        assert audit.selected_proposal is not None
-        assert audit.verification_report is not None
-        sel = audit.selected_proposal
-        ver = audit.verification_report
-        matched = (
-            audit.diagnosis.fault_class in exp.expected_fault_classes
-            and sel.action_id == exp.expected_action_id.value
-            and sel.target_unit == exp.expected_target_unit
-            and ver.status == exp.expected_verification_status
-            and ver.collateral_failures == exp.expected_collateral_failures
-            and audit.escalated == exp.expected_escalated
-        )
-        assert matched is True, f"Scenario {exp.scenario_id} failed expectation"
-        smoke_runs.append(
-            SmokeScenarioRunResult(
-                scenario_id=exp.scenario_id,
-                repeat_index=1,
-                diagnosed_fault=audit.diagnosis.fault_class,
-                selected_action_id=sel.action_id,
-                selected_target_unit=sel.target_unit,
-                verification_status=ver.status,
-                collateral_failures=ver.collateral_failures,
-                samples_collected=ver.samples_collected,
-                soak_wall_clock_sec=float(soak_step[0]),
-                soak_budget_ok=True,
-                ssh_command_count=1,
-                mutating_commands_executed=1,
-                escalated=audit.escalated,
-                matched_expectation=matched,
-            )
-        )
-
-    manifest = build_lab_run_manifest(
-        repo_root=repo_root,
-        config_path=repo_root / "configs" / "phase1_lab.yaml",
-        sudoers_path=repo_root / "lab" / "systemd" / "gateheal-sudoers.conf",
-        ssh_latency=latency,
-        conformance_facts=parse_conformance_output(
-            "PASS: FACT_1_RESTART_NO_NRESTARTS_ZERO :: ok\n"
-        ),
-        smoke_matrix=smoke_runs,
-        clock_utc=lambda: now_dt,
-    )
-    assert manifest.conformance_all_passed is True
-    assert manifest.smoke_all_passed is True
-    assert len(manifest.config_sha256) == 64
-    assert len(manifest.sudoers_sha256) == 64
-
-
-@pytest.mark.skipif(
-    os.environ.get("GATEHEAL_RUN_LAB_TESTS") != "1",
-    reason=(
-        "Set GATEHEAL_RUN_LAB_TESTS=1 with booted QEMU/KVM guest on "
-        "127.0.0.1:2222"
-    ),
-)
-def test_wp5_live_vm_ssh_conformance_and_captured_fixture_freshness() -> None:
-    """Live VM check (Spec G): validate manifest, hashes, kernel, and root key denial."""
-    repo_root = _repo_root()
-    manifest_path = repo_root / "artifacts" / "wp5_lab_manifest.json"
-    if not manifest_path.is_file():
-        pytest.fail(
-            f"Runbook pointer: Missing live manifest at {manifest_path}; "
-            "run python lab/scripts/wp5_capture_and_verify.py first."
-        )
-    manifest = LabRunManifest.model_validate_json(
-        manifest_path.read_text(encoding="utf-8")
-    )
-    if not manifest.conformance_all_passed or not manifest.smoke_all_passed:
-        pytest.fail(
-            "Runbook pointer: Manifest conformance or smoke checks failed; "
-            "review lab/scripts/check_conformance.sh and re-run capture script."
-        )
-
-    assert manifest.conformance_all_passed is True
-    assert manifest.smoke_all_passed is True
-    assert len(manifest.smoke_matrix) == 21  # 7 scenarios × 3 repeats
-
-    fixture = _load_fixture_json()
-    assert manifest.guest_kernel == fixture["guest_kernel"]
-    assert manifest.guest_systemd_version == fixture["guest_systemd_version"]
-
-    ssh_port = int(os.environ.get("GATEHEAL_LAB_SSH_PORT", "2222"))
-    ssh_user = os.environ.get("GATEHEAL_LAB_SSH_USER", "ubuntu")
-    default_key = Path.home() / ".cache" / "gateheal-vm" / "id_ed25519"
-    ssh_key = os.environ.get("GATEHEAL_LAB_SSH_KEY") or (
-        str(default_key) if default_key.is_file() else None
-    )
-    transport = SSHLabTransport(
-        host="127.0.0.1",
-        port=ssh_port,
-        user=ssh_user,
-        identity_file=ssh_key,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-    latency = measure_transport_latency(transport, samples=5)
-    assert latency.max_ms < 5000.0
-
-    uname_res = transport.run(("uname", "-r"), timeout_sec=5.0)
-    sysd_res = transport.run(("systemctl", "--version"), timeout_sec=5.0)
-    live_kernel = uname_res.stdout_excerpt.strip()
-    live_systemd = sysd_res.stdout_excerpt.splitlines()[0].strip()
-
-    assert live_kernel == manifest.guest_kernel
-    assert live_systemd == manifest.guest_systemd_version
-
-    # Config and sudoers hashes match current files on disk
-    cfg_path = repo_root / "configs" / "phase1_lab.yaml"
-    sudoers_path = repo_root / "lab" / "systemd" / "gateheal-sudoers.conf"
-    from gateheal.lab_bringup import compute_file_sha256
-
-    assert manifest.config_sha256 == compute_file_sha256(cfg_path)
-    assert manifest.sudoers_sha256 == compute_file_sha256(sudoers_path)
-
-    # Controller key root denial verified
-    root_with_controller_key = SSHLabTransport(
-        host="127.0.0.1",
-        port=ssh_port,
-        user="root",
-        identity_file=ssh_key,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
-    with pytest.raises(TransportUnavailableError) as exc_info:
-        root_with_controller_key.run(("id",), timeout_sec=5.0)
-    assert exc_info.value.exit_code != 0
-````
-
 ## File: tests/unit/test_policy_gate.py
 ````python
 """Unit, regression, and property-based tests for PolicyEngine and MinimalImpactSelector."""
@@ -12373,801 +11880,44 @@ def test_wp2_orchestrator_wal_hash_chain_rotation_and_toctou_abort(
     assert "mismatch" in tamp_msg.lower()
 ````
 
-## File: lab/qemu/manage_vm.sh
-````bash
-#!/usr/bin/env bash
-# Host-side helper to bootstrap, verify SHA256SUMS, sync/provision, build lab-golden.qcow2, and manage QEMU/KVM overlays.
-set -euo pipefail
+## File: docs/threat-model.md
+````markdown
+# GateHeal Security & Threat Model (Phase 2 & WP2/WP3/WP4/WP5 Hardened)
 
-ACTION="${1:-help}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VM_DIR="${GATEHEAL_VM_DIR:-$HOME/.cache/gateheal-vm}"
-BASE_IMAGE="${GATEHEAL_BASE_IMAGE:-${VM_DIR}/ubuntu-24.04-base.qcow2}"
-GOLDEN_IMAGE="${GATEHEAL_GOLDEN_IMAGE:-${VM_DIR}/ubuntu-24.04-golden.qcow2}"
-OVERLAY_IMAGE="${GATEHEAL_OVERLAY_IMAGE:-${VM_DIR}/lab-overlay.qcow2}"
-SEED_ISO="${VM_DIR}/seed.iso"
-SEED_HASH_FILE="${VM_DIR}/seed.hash"
-SSH_KEY="${GATEHEAL_LAB_SSH_KEY:-${VM_DIR}/id_ed25519}"
-HARNESS_KEY="${GATEHEAL_LAB_HARNESS_KEY:-${VM_DIR}/id_harness_ed25519}"
-KNOWN_HOSTS_FILE="${GATEHEAL_LAB_KNOWN_HOSTS:-${VM_DIR}/known_hosts}"
-PID_FILE="${VM_DIR}/qemu.pid"
-SSH_PORT="${GATEHEAL_LAB_SSH_PORT:-2222}"
-SHA256SUMS_FILE="${VM_DIR}/SHA256SUMS"
-PIN_FILE="${VM_DIR}/base.pin"
-RELEASE_FILE="${VM_DIR}/base_image_release"
-GUEST_REPO_DIR="${GATEHEAL_GUEST_REPO_DIR:-/opt/gateheal}"
+## 1. Trust Boundaries
+GateHeal enforces four explicit trust zones[cite: 6]:
+1. **Zone 1 (Isolated Linux Lab):** Disposable QEMU/KVM Ubuntu VM verified via `/etc/gateheal-lab-sentinel` and `systemd-detect-virt`[cite: 6].
+2. **Zone 2 (Observation & Sanitization):** `IncidentCollector` performs best-effort full-text secret redaction before line splitting, enforces per-line byte caps (`512` B) and per-service fair byte budgets, keeps the newest tail lines, and wraps every log line in `[UNTRUSTED_LOG] `[cite: 6].
+3. **Zone 3 (Advisory Plane):** Deterministic `DiagnosisEngine` and bounded `AgentProposer` modules. Possesses zero subprocess execution authority[cite: 6].
+4. **Zone 4 (Independent Policy, Execution & Oracle Plane):** `PolicyEngine` (sole minting authority for single-use HMAC-signed `AuthorizedActionCapability` objects), `MinimalImpactSelector`, `ExecutionController`, `OutcomeVerifier` (independent multi-sample soak oracle), `EscalationSink`, and `AuditRecorder`[cite: 6].
 
-BASE_image_release="${GATEHEAL_CLOUD_RELEASE:-current}"
-CLOUD_RELEASE_URL="https://cloud-images.ubuntu.com/releases/noble/${BASE_image_release}"
-CLOUD_IMG_NAME="noble-server-cloudimg-amd64.img"
+## 2. Host Workstation Protection & Guest Sudoers Contract
+- `LocalLabSubprocessTransport` requires `GATEHEAL_INSIDE_LAB=1`, a non-`omarchy` kernel, `/etc/gateheal-lab-sentinel` matching `GATEHEAL_ISOLATED_LAB_GUEST_V1`, and `systemd-detect-virt` reporting an allowed guest hypervisor/container[cite: 6].
+- `SSHLabTransport` enforces a loopback target IP (`127.0.0.1`/`::1`/`localhost`), validates `--ssh-user` against `^[a-z_][a-z0-9_-]{0,31}$`, uses a dedicated `UserKnownHostsFile` (`~/.cache/gateheal-vm/known_hosts`) with `IdentitiesOnly=yes`, places `--` before `user@host`, verifies `/etc/gateheal-lab-sentinel` over SSH by default (`verify_remote_sentinel=True`), distinguishes SSH connectivity failures (`TransportUnavailableError` on exit `255`/`124`/`137` or timeout) from missing/mismatched sentinel files (`HostSafetyViolationError`), and supports remote `timeout` + `/usr/bin/systemd-run --scope`[cite: 6].
+- Mutating service actions execute via `sudo -n /usr/bin/systemctl reload|restart <unit>`, matching the `visudo -cf` verified allowlist in `lab/systemd/gateheal-sudoers.conf`[cite: 6].
+- **Dual-Key Controller vs. Harness SSH Separation (Spec H):** The controller uses an unprivileged SSH key (`id_ed25519`) authorized solely for `ubuntu` (and explicitly rejected for `root` with exit `255` `Permission denied`), whereas fault injection and lab resets use a separate harness key (`id_harness_ed25519`) installed exclusively in `/root/.ssh/authorized_keys` (without `from="127.0.0.1"`, because QEMU SLIRP user-mode port forwarding presents the host connection source as `10.0.2.2` inside the guest). QEMU user networking runs with `restrict=on` (Spec C4) so the guest cannot initiate outbound network connections[cite: 6].
 
-mkdir -p "$VM_DIR"
-
-SSH_COMMON_OPTS=(
-    -p "$SSH_PORT"
-    -o BatchMode=yes
-    -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
-    -o StrictHostKeyChecking=accept-new
-    -o LogLevel=ERROR
-    -o IdentitiesOnly=yes
-    -o ConnectTimeout=5
-)
-
-ensure_keys() {
-    if [[ ! -f "$SSH_KEY" ]]; then
-        ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "gateheal-controller-ubuntu" >/dev/null
-        echo "Generated controller SSH key at $SSH_KEY"
-    fi
-    if [[ ! -f "$HARNESS_KEY" ]]; then
-        ssh-keygen -t ed25519 -N "" -f "$HARNESS_KEY" -C "gateheal-harness-root" >/dev/null
-        echo "Generated harness SSH key at $HARNESS_KEY"
-    fi
-}
-
-check_seed_iso() {
-    ensure_keys
-    local ud="${VM_DIR}/user-data"
-    local md="${VM_DIR}/meta-data"
-    local ctrl_pub harness_pub
-    ctrl_pub="$(cat "${SSH_KEY}.pub")"
-    harness_pub="$(cat "${HARNESS_KEY}.pub")"
-
-    cat <<YAML > "$ud"
-#cloud-config
-hostname: gateheal-lab
-disable_root: false
-users:
-  - name: ubuntu
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: users, admin, sudo, systemd-journal, adm
-    home: /home/ubuntu
-    shell: /bin/bash
-    lock_passwd: false
-    ssh_authorized_keys:
-      - ${ctrl_pub}
-  - name: root
-    ssh_authorized_keys:
-      - ${harness_pub}
-ssh_pwauth: false
-package_update: false
-YAML
-
-    cat <<YAML > "$md"
-instance-id: gateheal-lab-01
-local-hostname: gateheal-lab
-YAML
-
-    local current_hash
-    current_hash="$(sha256sum "$ud" "${SSH_KEY}.pub" "${HARNESS_KEY}.pub" | sha256sum | awk '{print $1}')"
-    if [[ ! -f "$SEED_ISO" || ! -f "$SEED_HASH_FILE" || "$(cat "$SEED_HASH_FILE")" != "$current_hash" ]]; then
-        if command -v cloud-localds >/dev/null 2>&1; then
-            cloud-localds "$SEED_ISO" "$ud" "$md"
-        elif command -v xorriso >/dev/null 2>&1; then
-            xorriso -as mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-        elif command -v genisoimage >/dev/null 2>&1; then
-            genisoimage -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-        elif command -v mkisofs >/dev/null 2>&1; then
-            mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-        elif command -v mkfs.vfat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
-            rm -f "$SEED_ISO"
-            mkfs.vfat -n cidata -C "$SEED_ISO" 2048 >/dev/null
-            mcopy -i "$SEED_ISO" "$ud" ::user-data
-            mcopy -i "$SEED_ISO" "$md" ::meta-data
-        else
-            echo "FATAL: Install xorriso, cdrtools, or mtools+dosfstools to build cloud-init seed." >&2
-            exit 1
-        fi
-        echo "$current_hash" > "$SEED_HASH_FILE"
-    fi
-}
-
-case "$ACTION" in
-    bootstrap-base)
-        ensure_keys
-        echo "$BASE_image_release" > "$RELEASE_FILE"
-        if [[ ! -f "$BASE_IMAGE" ]]; then
-            echo "Downloading Ubuntu 24.04 (${BASE_image_release}) cloud image and SHA256SUMS ..."
-            curl -fsSL "${CLOUD_RELEASE_URL}/SHA256SUMS" -o "$SHA256SUMS_FILE"
-            curl -fL "${CLOUD_RELEASE_URL}/${CLOUD_IMG_NAME}" -o "${VM_DIR}/${CLOUD_IMG_NAME}"
-            (
-                cd "$VM_DIR"
-                grep " \*${CLOUD_IMG_NAME}\$" "$SHA256SUMS_FILE" > "${SHA256SUMS_FILE}.target"
-                sha256sum -c "${SHA256SUMS_FILE}.target"
-            )
-            qemu-img resize "${VM_DIR}/${CLOUD_IMG_NAME}" 10G >/dev/null
-            mv "${VM_DIR}/${CLOUD_IMG_NAME}" "$BASE_IMAGE"
-            sha256sum "$BASE_IMAGE" | awk '{print $1}' > "$PIN_FILE"
-        else
-            if [[ ! -f "$PIN_FILE" ]]; then
-                sha256sum "$BASE_IMAGE" | awk '{print $1}' > "$PIN_FILE"
-            fi
-            current_actual="$(sha256sum "$BASE_IMAGE" | awk '{print $1}')"
-            pinned_expected="$(cat "$PIN_FILE")"
-            if [[ "$current_actual" != "$pinned_expected" ]]; then
-                echo "FATAL: Base image sha256 ($current_actual) does not match pin ($pinned_expected)." >&2
-                exit 1
-            fi
-        fi
-        check_seed_iso
-        echo "BOOTSTRAP_OK: Release=${BASE_image_release}, Base=${BASE_IMAGE}, ControllerKey=${SSH_KEY}, HarnessKey=${HARNESS_KEY}"
-        ;;
-    create-overlay|reset-overlay)
-        if [[ -f "$GOLDEN_IMAGE" ]]; then
-            BACKING="$GOLDEN_IMAGE"
-            echo "Creating overlay backed by provisioned golden image ($GOLDEN_IMAGE) ..."
-        elif [[ -f "$BASE_IMAGE" ]]; then
-            BACKING="$BASE_IMAGE"
-            echo "WARN: Creating overlay backed by raw base image ($BASE_IMAGE); run '$0 provision' after boot."
-        else
-            echo "FATAL: Base image not found at $BASE_IMAGE. Run '$0 bootstrap-base' first." >&2
-            exit 1
-        fi
-        rm -f "$OVERLAY_IMAGE" "$KNOWN_HOSTS_FILE"
-        qemu-img create -f qcow2 -b "$(realpath "$BACKING")" -F qcow2 "$OVERLAY_IMAGE" >/dev/null
-        echo "OVERLAY_OK: $OVERLAY_IMAGE -> $BACKING (cleared $KNOWN_HOSTS_FILE)"
-        ;;
-    sync-repo)
-        ensure_keys
-        mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
-        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-                "mkdir -p ${GUEST_REPO_DIR} && chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
-        elif ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "sudo -n true" >/dev/null 2>&1; then
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
-                "sudo -n mkdir -p ${GUEST_REPO_DIR} && sudo -n chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
-        fi
-        rsync -az --delete \
-            --exclude '.git' \
-            --exclude 'artifacts' \
-            --exclude '.venv' \
-            --exclude '__pycache__' \
-            --exclude '.mypy_cache' \
-            --exclude '.pytest_cache' \
-            --exclude '.ruff_cache' \
-            -e "ssh -p ${SSH_PORT} -o BatchMode=yes -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o IdentitiesOnly=yes -i ${SSH_KEY}" \
-            "${REPO_ROOT}/" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/"
-        scp -P "$SSH_PORT" \
-            -o BatchMode=yes \
-            -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}" \
-            -o StrictHostKeyChecking=accept-new \
-            -o LogLevel=ERROR \
-            -o IdentitiesOnly=yes \
-            -i "$SSH_KEY" \
-            "${HARNESS_KEY}.pub" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/.harness_key.pub" >/dev/null
-        echo "SYNC_OK: Synced repo and harness public key to ubuntu@127.0.0.1:${GUEST_REPO_DIR}"
-        ;;
-    provision)
-        ensure_keys
-        "$0" sync-repo
-        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-                "bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
-        else
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
-                "sudo -n bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
-        fi
-        ;;
-    boot-vm)
-        ensure_keys
-        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "VM already running (PID $(cat "$PID_FILE"))."
-            exit 0
-        fi
-        if [[ ! -f "$OVERLAY_IMAGE" ]]; then
-            "$0" create-overlay
-        fi
-        check_seed_iso
-        qemu-system-x86_64 \
-            -enable-kvm \
-            -cpu host \
-            -m 2048 \
-            -smp 2 \
-            -drive "file=${OVERLAY_IMAGE},format=qcow2,if=virtio" \
-            -drive "file=${SEED_ISO},format=raw,if=virtio,readonly=on" \
-            -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22 \
-            -device virtio-net-pci,netdev=net0 \
-            -display none \
-            -pidfile "$PID_FILE" \
-            -daemonize
-        echo "Booted QEMU/KVM VM (PID $(cat "$PID_FILE")) with restrict=on on 127.0.0.1:${SSH_PORT}"
-        ;;
-    wait-ssh)
-        ensure_keys
-        mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
-        echo "Waiting for SSH on 127.0.0.1:${SSH_PORT} (known_hosts=${KNOWN_HOSTS_FILE}) ..."
-        for _ in $(seq 1 60); do
-            if ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
-                echo "SSH_READY on 127.0.0.1:${SSH_PORT}"
-                exit 0
-            fi
-            sleep 2
-        done
-        echo "FATAL: Timed out waiting for SSH on 127.0.0.1:${SSH_PORT}" >&2
-        exit 1
-        ;;
-    build-golden)
-        ensure_keys
-        if ! "$0" status >/dev/null 2>&1; then
-            "$0" boot-vm
-            "$0" wait-ssh
-        fi
-        "$0" provision
-        "$0" stop-vm
-        sleep 1
-        qemu-img convert -O qcow2 "$OVERLAY_IMAGE" "$GOLDEN_IMAGE"
-        qemu-img check "$GOLDEN_IMAGE"
-        "$0" create-overlay
-        echo "GOLDEN_OK: Saved provisioned golden image at $GOLDEN_IMAGE and created fresh overlay."
-        ;;
-    reset-guest)
-        ensure_keys
-        ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-            "GATEHEAL_INSIDE_LAB=1 bash ${GUEST_REPO_DIR}/lab/reset/reset_lab.sh"
-        echo "RESET_GUEST_OK: In-guest services reset to clean baseline."
-        ;;
-    stop-vm)
-        if [[ -f "$PID_FILE" ]]; then
-            pid="$(cat "$PID_FILE")"
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "Attempting graceful poweroff inside VM..."
-                ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-                    "sync; systemctl poweroff" >/dev/null 2>&1 || true
-                for _ in $(seq 1 30); do
-                    if ! kill -0 "$pid" 2>/dev/null; then
-                        break
-                    fi
-                    sleep 1
-                done
-            fi
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "Graceful shutdown timed out; terminating QEMU (PID $pid)..."
-                kill "$pid" 2>/dev/null || true
-                for _ in $(seq 1 10); do
-                    if ! kill -0 "$pid" 2>/dev/null; then
-                        break
-                    fi
-                    sleep 0.2
-                done
-            fi
-            rm -f "$PID_FILE"
-            echo "Stopped VM."
-        else
-            echo "No PID file at $PID_FILE."
-        fi
-        ;;
-    status)
-        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "RUNNING (PID $(cat "$PID_FILE"))"
-        else
-            echo "STOPPED"
-            exit 1
-        fi
-        ;;
-    *)
-        echo "Usage: $0 {bootstrap-base|create-overlay|reset-overlay|boot-vm|wait-ssh|sync-repo|provision|build-golden|reset-guest|stop-vm|status}"
-        ;;
-esac#!/usr/bin/env bash
-# Host-side helper to bootstrap, verify SHA256SUMS, sync/provision, build lab-golden.qcow2, and manage QEMU/KVM overlays.
-set -euo pipefail
-
-ACTION="${1:-help}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VM_DIR="${GATEHEAL_VM_DIR:-$HOME/.cache/gateheal-vm}"
-BASE_IMAGE="${GATEHEAL_BASE_IMAGE:-${VM_DIR}/ubuntu-24.04-base.qcow2}"
-GOLDEN_IMAGE="${GATEHEAL_GOLDEN_IMAGE:-${VM_DIR}/lab-golden.qcow2}"
-OVERLAY_IMAGE="${GATEHEAL_OVERLAY_IMAGE:-${VM_DIR}/lab-overlay.qcow2}"
-SEED_ISO="${VM_DIR}/seed.iso"
-SSH_KEY="${GATEHEAL_LAB_SSH_KEY:-${VM_DIR}/id_ed25519}"
-HARNESS_KEY="${GATEHEAL_LAB_HARNESS_KEY:-${VM_DIR}/id_harness_ed25519}"
-LEGACY_HARNESS_KEY="${VM_DIR}/id_ed25519_harness"
-KNOWN_HOSTS_FILE="${GATEHEAL_LAB_KNOWN_HOSTS:-${VM_DIR}/known_hosts}"
-PID_FILE="${VM_DIR}/qemu.pid"
-SSH_PORT="${GATEHEAL_LAB_SSH_PORT:-2222}"
-SHA256SUMS_FILE="${VM_DIR}/SHA256SUMS"
-RESIZED_SHA256_FILE="${VM_DIR}/BASE_IMAGE.sha256"
-RELEASE_FILE="${VM_DIR}/base_image_release"
-GUEST_REPO_DIR="${GATEHEAL_GUEST_REPO_DIR:-/opt/gateheal}"
-
-# Version-pinned Ubuntu 24.04 Noble cloud image release
-BASE_IMAGE_RELEASE="${GATEHEAL_BASE_IMAGE_RELEASE:-release-20250219}"
-CLOUD_RELEASE_URL="https://cloud-images.ubuntu.com/releases/noble/${BASE_IMAGE_RELEASE}"
-CLOUD_IMG_NAME="noble-server-cloudimg-amd64.img"
-
-mkdir -p "$VM_DIR"
-
-SSH_COMMON_OPTS=(
-    -p "$SSH_PORT"
-    -o BatchMode=yes
-    -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
-    -o StrictHostKeyChecking=accept-new
-    -o LogLevel=ERROR
-    -o IdentitiesOnly=yes
-    -o ConnectTimeout=5
-)
-
-ensure_keys() {
-    if [[ ! -f "$SSH_KEY" ]]; then
-        ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "gateheal-controller-ubuntu" >/dev/null
-        echo "Generated controller SSH key at $SSH_KEY"
-    fi
-    if [[ ! -f "$HARNESS_KEY" ]]; then
-        if [[ -f "$LEGACY_HARNESS_KEY" && -f "${LEGACY_HARNESS_KEY}.pub" ]]; then
-            cp -p "$LEGACY_HARNESS_KEY" "$HARNESS_KEY"
-            cp -p "${LEGACY_HARNESS_KEY}.pub" "${HARNESS_KEY}.pub"
-            chmod 0600 "$HARNESS_KEY"
-        else
-            ssh-keygen -t ed25519 -N "" -f "$HARNESS_KEY" -C "gateheal-harness-root" >/dev/null
-            echo "Generated harness SSH key at $HARNESS_KEY"
-        fi
-    fi
-}
-
-build_seed_iso() {
-    ensure_keys
-    local ud="${VM_DIR}/user-data"
-    local md="${VM_DIR}/meta-data"
-    local ctrl_pub harness_pub
-    ctrl_pub="$(cat "${SSH_KEY}.pub")"
-    harness_pub="$(cat "${HARNESS_KEY}.pub")"
-
-    cat <<YAML > "$ud"
-#cloud-config
-hostname: gateheal-lab
-disable_root: false
-users:
-  - name: ubuntu
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: users, admin, sudo, systemd-journal, adm
-    home: /home/ubuntu
-    shell: /bin/bash
-    lock_passwd: false
-    ssh_authorized_keys:
-      - ${ctrl_pub}
-  - name: root
-    ssh_authorized_keys:
-      - from="127.0.0.1" ${harness_pub}
-ssh_pwauth: false
-package_update: false
-YAML
-
-    cat <<YAML > "$md"
-instance-id: gateheal-lab-01
-local-hostname: gateheal-lab
-YAML
-
-    if command -v cloud-localds >/dev/null 2>&1; then
-        cloud-localds "$SEED_ISO" "$ud" "$md"
-    elif command -v genisoimage >/dev/null 2>&1; then
-        genisoimage -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-    elif command -v mkisofs >/dev/null 2>&1; then
-        mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-    elif command -v xorriso >/dev/null 2>&1; then
-        xorriso -as mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-    elif command -v mkfs.vfat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
-        rm -f "$SEED_ISO"
-        mkfs.vfat -n cidata -C "$SEED_ISO" 2048 >/dev/null
-        mcopy -i "$SEED_ISO" "$ud" ::user-data
-        mcopy -i "$SEED_ISO" "$md" ::meta-data
-    else
-        echo "FATAL: Install xorriso, cdrtools, or mtools+dosfstools to build cloud-init seed." >&2
-        exit 1
-    fi
-}
-
-case "$ACTION" in
-    bootstrap-base)
-        ensure_keys
-        echo "$BASE_IMAGE_RELEASE" > "$RELEASE_FILE"
-        if [[ ! -f "$BASE_IMAGE" ]]; then
-            echo "Downloading Ubuntu 24.04 (${BASE_IMAGE_RELEASE}) cloud image and SHA256SUMS ..."
-            curl -fsSL "${CLOUD_RELEASE_URL}/SHA256SUMS" -o "$SHA256SUMS_FILE"
-            curl -fL "${CLOUD_RELEASE_URL}/${CLOUD_IMG_NAME}" -o "${VM_DIR}/${CLOUD_IMG_NAME}"
-            (
-                cd "$VM_DIR"
-                grep " \*${CLOUD_IMG_NAME}\$" "$SHA256SUMS_FILE" > "${SHA256SUMS_FILE}.target"
-                sha256sum -c "${SHA256SUMS_FILE}.target"
-            )
-            qemu-img resize "${VM_DIR}/${CLOUD_IMG_NAME}" 10G >/dev/null
-            mv "${VM_DIR}/${CLOUD_IMG_NAME}" "$BASE_IMAGE"
-            sha256sum "$BASE_IMAGE" > "$RESIZED_SHA256_FILE"
-        else
-            if [[ ! -f "$RESIZED_SHA256_FILE" ]]; then
-                if [[ -f "$SHA256SUMS_FILE" ]] && grep -q "$BASE_IMAGE" "$SHA256SUMS_FILE"; then
-                    cp "$SHA256SUMS_FILE" "$RESIZED_SHA256_FILE"
-                else
-                    sha256sum "$BASE_IMAGE" > "$RESIZED_SHA256_FILE"
-                fi
-            fi
-            sha256sum -c "$RESIZED_SHA256_FILE"
-        fi
-        build_seed_iso
-        echo "BOOTSTRAP_OK: Release=${BASE_IMAGE_RELEASE}, Base=${BASE_IMAGE}, ControllerKey=${SSH_KEY}, HarnessKey=${HARNESS_KEY}"
-        ;;
-    create-overlay|reset-overlay)
-        if [[ -f "$GOLDEN_IMAGE" ]]; then
-            BACKING="$GOLDEN_IMAGE"
-            echo "Creating overlay backed by provisioned golden image ($GOLDEN_IMAGE) ..."
-        elif [[ -f "$BASE_IMAGE" ]]; then
-            BACKING="$BASE_IMAGE"
-            echo "WARN: Creating overlay backed by raw base image ($BASE_IMAGE); run '$0 provision' or '$0 build-golden' after boot."
-        else
-            echo "FATAL: Base image not found at $BASE_IMAGE. Run '$0 bootstrap-base' first." >&2
-            exit 1
-        fi
-        rm -f "$OVERLAY_IMAGE" "$KNOWN_HOSTS_FILE"
-        qemu-img create -f qcow2 -b "$(realpath "$BACKING")" -F qcow2 "$OVERLAY_IMAGE" >/dev/null
-        echo "OVERLAY_OK: $OVERLAY_IMAGE -> $BACKING (cleared $KNOWN_HOSTS_FILE)"
-        ;;
-    boot-vm)
-        ensure_keys
-        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "VM already running (PID $(cat "$PID_FILE"))."
-            exit 0
-        fi
-        if [[ ! -f "$OVERLAY_IMAGE" ]]; then
-            "$0" create-overlay
-        fi
-        if [[ ! -f "$SEED_ISO" ]]; then
-            build_seed_iso
-        fi
-        qemu-system-x86_64 \
-            -enable-kvm \
-            -cpu host \
-            -m 2048 \
-            -smp 2 \
-            -drive "file=${OVERLAY_IMAGE},format=qcow2,if=virtio" \
-            -drive "file=${SEED_ISO},format=raw,if=virtio,readonly=on" \
-            -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22 \
-            -device virtio-net-pci,netdev=net0 \
-            -display none \
-            -pidfile "$PID_FILE" \
-            -daemonize
-        echo "Booted QEMU/KVM VM (PID $(cat "$PID_FILE")) with restrict=on on 127.0.0.1:${SSH_PORT}"
-        ;;
-    wait-ssh)
-        ensure_keys
-        mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
-        echo "Waiting for SSH on 127.0.0.1:${SSH_PORT} (known_hosts=${KNOWN_HOSTS_FILE}) ..."
-        for _ in $(seq 1 60); do
-            if ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
-                echo "SSH_READY on 127.0.0.1:${SSH_PORT}"
-                exit 0
-            fi
-            sleep 2
-        done
-        echo "FATAL: Timed out waiting for SSH on 127.0.0.1:${SSH_PORT}" >&2
-        exit 1
-        ;;
-    sync-repo)
-        ensure_keys
-        mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
-        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-                "mkdir -p ${GUEST_REPO_DIR} && chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
-        elif ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "sudo -n true" >/dev/null 2>&1; then
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
-                "sudo -n mkdir -p ${GUEST_REPO_DIR} && sudo -n chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
-        fi
-        rsync -az --delete \
-            --exclude '.git' \
-            --exclude 'artifacts' \
-            --exclude '.venv' \
-            --exclude '__pycache__' \
-            --exclude '.mypy_cache' \
-            --exclude '.pytest_cache' \
-            --exclude '.ruff_cache' \
-            -e "ssh -p ${SSH_PORT} -o BatchMode=yes -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o IdentitiesOnly=yes -i ${SSH_KEY}" \
-            "${REPO_ROOT}/" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/"
-        scp -P "$SSH_PORT" \
-            -o BatchMode=yes \
-            -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}" \
-            -o StrictHostKeyChecking=accept-new \
-            -o LogLevel=ERROR \
-            -o IdentitiesOnly=yes \
-            -i "$SSH_KEY" \
-            "${HARNESS_KEY}.pub" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/.harness_key.pub" >/dev/null
-        echo "SYNC_OK: Synced repo and harness public key to ubuntu@127.0.0.1:${GUEST_REPO_DIR}"
-        ;;
-    provision)
-        ensure_keys
-        "$0" sync-repo
-        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-                "bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
-        else
-            ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
-                "sudo -n bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
-        fi
-        ;;
-    build-golden)
-        ensure_keys
-        if ! "$0" status >/dev/null 2>&1; then
-            "$0" boot-vm
-            "$0" wait-ssh
-        fi
-        "$0" provision
-        "$0" stop-vm
-        sleep 1
-        qemu-img convert -O qcow2 "$OVERLAY_IMAGE" "$GOLDEN_IMAGE"
-        "$0" create-overlay
-        echo "GOLDEN_OK: Saved provisioned golden image at $GOLDEN_IMAGE and created fresh overlay."
-        ;;
-    reset-guest)
-        ensure_keys
-        ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
-            "GATEHEAL_INSIDE_LAB=1 bash ${GUEST_REPO_DIR}/lab/reset/reset_lab.sh"
-        echo "RESET_GUEST_OK: In-guest services reset to clean baseline."
-        ;;
-    stop-vm)
-        if [[ -f "$PID_FILE" ]]; then
-            kill "$(cat "$PID_FILE")" 2>/dev/null || true
-            for _ in $(seq 1 25); do
-                if ! kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-                    break
-                fi
-                sleep 0.2
-            done
-            rm -f "$PID_FILE"
-            echo "Stopped VM."
-        else
-            echo "No PID file at $PID_FILE."
-        fi
-        ;;
-    status)
-        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "RUNNING (PID $(cat "$PID_FILE"))"
-        else
-            echo "STOPPED"
-            exit 1
-        fi
-        ;;
-    *)
-        echo "Usage: $0 {bootstrap-base|create-overlay|reset-overlay|boot-vm|wait-ssh|sync-repo|provision|build-golden|reset-guest|stop-vm|status}"
-        ;;
-esac#!/usr/bin/env bash
-# Host-side helper to bootstrap, verify SHA256SUMS, build golden image, and manage QEMU/KVM overlays.
-set -euo pipefail
-
-ACTION="${1:-help}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VM_DIR="${GATEHEAL_VM_DIR:-$HOME/.cache/gateheal-vm}"
-BASE_IMAGE="${GATEHEAL_BASE_IMAGE:-${VM_DIR}/ubuntu-24.04-base.qcow2}"
-GOLDEN_IMAGE="${GATEHEAL_GOLDEN_IMAGE:-${VM_DIR}/ubuntu-24.04-golden.qcow2}"
-OVERLAY_IMAGE="${GATEHEAL_OVERLAY_IMAGE:-${VM_DIR}/lab-overlay.qcow2}"
-SEED_ISO="${VM_DIR}/seed.iso"
-SSH_KEY="${GATEHEAL_LAB_SSH_KEY:-${VM_DIR}/id_ed25519}"
-HARNESS_KEY="${GATEHEAL_LAB_HARNESS_KEY:-${VM_DIR}/id_ed25519_harness}"
-PID_FILE="${VM_DIR}/qemu.pid"
-SSH_PORT="${GATEHEAL_LAB_SSH_PORT:-2222}"
-SHA256SUMS_FILE="${VM_DIR}/SHA256SUMS"
-
-# Pinned Ubuntu 24.04 Noble release & resized base image SHA-256
-CLOUD_RELEASE_BASE="https://cloud-images.ubuntu.com/noble/current"
-CLOUD_IMG_NAME="noble-server-cloudimg-amd64.img"
-PINNED_BASE_QCOW2_SHA256="${GATEHEAL_PINNED_BASE_SHA256:-c6976b798fc9bf0641fa119a6b3f7b09cc46656cbfe9fd31ac593d5b1d6e206f}"
-
-mkdir -p "$VM_DIR"
-
-ensure_keys() {
-    if [[ ! -f "$SSH_KEY" ]]; then
-        ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "gateheal-controller-ubuntu" >/dev/null
-        echo "Generated controller SSH key at $SSH_KEY"
-    fi
-    if [[ ! -f "$HARNESS_KEY" ]]; then
-        ssh-keygen -t ed25519 -N "" -f "$HARNESS_KEY" -C "gateheal-harness-root" >/dev/null
-        echo "Generated harness SSH key at $HARNESS_KEY"
-    fi
-}
-
-verify_base_sha256() {
-    local actual_sha
-    actual_sha="$(sha256sum "$BASE_IMAGE" | awk '{print $1}')"
-    echo "${PINNED_BASE_QCOW2_SHA256}  ${BASE_IMAGE}" > "$SHA256SUMS_FILE"
-    if ! sha256sum --status -c "$SHA256SUMS_FILE" 2>/dev/null; then
-        echo "WARN: Base image SHA-256 ($actual_sha) differs from default pin; updating $SHA256SUMS_FILE"
-        echo "${actual_sha}  ${BASE_IMAGE}" > "$SHA256SUMS_FILE"
-    fi
-    sha256sum -c "$SHA256SUMS_FILE"
-}
-
-build_seed_iso() {
-    ensure_keys
-    local ud="${VM_DIR}/user-data"
-    local md="${VM_DIR}/meta-data"
-    local ctrl_pub harness_pub
-    ctrl_pub="$(cat "${SSH_KEY}.pub")"
-    harness_pub="$(cat "${HARNESS_KEY}.pub")"
-
-    cat <<YAML > "$ud"
-#cloud-config
-hostname: gateheal-lab
-disable_root: false
-users:
-  - name: ubuntu
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: users, admin, sudo, systemd-journal, adm
-    home: /home/ubuntu
-    shell: /bin/bash
-    lock_passwd: false
-    ssh_authorized_keys:
-      - ${ctrl_pub}
-  - name: root
-    ssh_authorized_keys:
-      - ${harness_pub}
-ssh_pwauth: false
-package_update: false
-YAML
-
-    cat <<YAML > "$md"
-instance-id: gateheal-lab-01
-local-hostname: gateheal-lab
-YAML
-
-    if command -v cloud-localds >/dev/null 2>&1; then
-        cloud-localds "$SEED_ISO" "$ud" "$md"
-    elif command -v genisoimage >/dev/null 2>&1; then
-        genisoimage -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-    elif command -v mkisofs >/dev/null 2>&1; then
-        mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-    elif command -v xorriso >/dev/null 2>&1; then
-        xorriso -as mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
-    elif command -v mkfs.vfat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
-        rm -f "$SEED_ISO"
-        mkfs.vfat -n cidata -C "$SEED_ISO" 2048 >/dev/null
-        mcopy -i "$SEED_ISO" "$ud" ::user-data
-        mcopy -i "$SEED_ISO" "$md" ::meta-data
-    else
-        echo "FATAL: Install xorriso, cdrtools, or mtools+dosfstools to build cloud-init seed." >&2
-        exit 1
-    fi
-}
-
-case "$ACTION" in
-    bootstrap-base)
-        ensure_keys
-        if [[ ! -f "$BASE_IMAGE" ]]; then
-            echo "Downloading Ubuntu 24.04 cloud image and SHA256SUMS ..."
-            curl -fsSL "${CLOUD_RELEASE_BASE}/SHA256SUMS" -o "${VM_DIR}/UPSTREAM_SHA256SUMS"
-            curl -fL "${CLOUD_RELEASE_BASE}/${CLOUD_IMG_NAME}" -o "${VM_DIR}/${CLOUD_IMG_NAME}"
-            (cd "$VM_DIR" && sha256sum -c --ignore-missing UPSTREAM_SHA256SUMS)
-            qemu-img resize "${VM_DIR}/${CLOUD_IMG_NAME}" 10G >/dev/null
-            mv "${VM_DIR}/${CLOUD_IMG_NAME}" "$BASE_IMAGE"
-        fi
-        verify_base_sha256
-        build_seed_iso
-        echo "BOOTSTRAP_OK: Base=$BASE_IMAGE, ControllerKey=$SSH_KEY, HarnessKey=$HARNESS_KEY"
-        ;;
-    create-overlay|reset-overlay)
-        if [[ -f "$GOLDEN_IMAGE" ]]; then
-            BACKING="$GOLDEN_IMAGE"
-            echo "Creating overlay backed by provisioned golden image ($GOLDEN_IMAGE) ..."
-        elif [[ -f "$BASE_IMAGE" ]]; then
-            BACKING="$BASE_IMAGE"
-            echo "WARN: Creating overlay backed by raw base image ($BASE_IMAGE); guest provisioning is erased until provision_guest.sh or build-golden is run."
-        else
-            echo "FATAL: Base image not found at $BASE_IMAGE. Run '$0 bootstrap-base' first." >&2
-            exit 1
-        fi
-        rm -f "$OVERLAY_IMAGE"
-        qemu-img create -f qcow2 -b "$(realpath "$BACKING")" -F qcow2 "$OVERLAY_IMAGE" >/dev/null
-        echo "OVERLAY_OK: $OVERLAY_IMAGE -> $BACKING"
-        ;;
-    build-golden)
-        ensure_keys
-        if ! "$0" status >/dev/null 2>&1; then
-            "$0" boot-vm
-            "$0" wait-ssh
-        fi
-        bash "${REPO_ROOT}/lab/scripts/sync_repo_to_guest.sh"
-        if ssh -p "$SSH_PORT" -i "$HARNESS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@127.0.0.1 "true" >/dev/null 2>&1; then
-            ssh -p "$SSH_PORT" -i "$HARNESS_KEY" -o BatchMode=yes root@127.0.0.1 "bash /opt/gateheal/lab/scripts/provision_guest.sh"
-        else
-            ssh -p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes ubuntu@127.0.0.1 "sudo -n bash /opt/gateheal/lab/scripts/provision_guest.sh"
-        fi
-        "$0" stop-vm
-        sleep 1
-        qemu-img convert -O qcow2 "$OVERLAY_IMAGE" "$GOLDEN_IMAGE"
-        rm -f "$OVERLAY_IMAGE"
-        qemu-img create -f qcow2 -b "$(realpath "$GOLDEN_IMAGE")" -F qcow2 "$OVERLAY_IMAGE" >/dev/null
-        echo "GOLDEN_OK: Saved provisioned golden image at $GOLDEN_IMAGE and created fresh overlay."
-        ;;
-    boot-vm)
-        ensure_keys
-        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "VM already running (PID $(cat "$PID_FILE"))."
-            exit 0
-        fi
-        if [[ ! -f "$OVERLAY_IMAGE" ]]; then
-            "$0" create-overlay
-        fi
-        if [[ ! -f "$SEED_ISO" ]]; then
-            build_seed_iso
-        fi
-        qemu-system-x86_64 \
-            -enable-kvm \
-            -cpu host \
-            -m 2048 \
-            -smp 2 \
-            -drive "file=${OVERLAY_IMAGE},format=qcow2,if=virtio" \
-            -drive "file=${SEED_ISO},format=raw,if=virtio,readonly=on" \
-            -netdev "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
-            -device virtio-net-pci,netdev=net0 \
-            -display none \
-            -pidfile "$PID_FILE" \
-            -daemonize
-        echo "Booted QEMU/KVM VM (PID $(cat "$PID_FILE")) with restrict=on on 127.0.0.1:${SSH_PORT}"
-        ;;
-    wait-ssh)
-        ensure_keys
-        echo "Waiting for SSH on 127.0.0.1:${SSH_PORT} ..."
-        ssh-keygen -R "[127.0.0.1]:${SSH_PORT}" >/dev/null 2>&1 || true
-        for _ in $(seq 1 60); do
-            if ssh -p "$SSH_PORT" -i "$SSH_KEY" \
-                -o BatchMode=yes \
-                -o StrictHostKeyChecking=accept-new \
-                -o ConnectTimeout=2 \
-                ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
-                echo "SSH_READY on 127.0.0.1:${SSH_PORT}"
-                exit 0
-            fi
-            sleep 2
-        done
-        echo "FATAL: Timed out waiting for SSH on 127.0.0.1:${SSH_PORT}" >&2
-        exit 1
-        ;;
-    reset-guest)
-        ensure_keys
-        ssh -p "$SSH_PORT" -i "$HARNESS_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            root@127.0.0.1 "GATEHEAL_INSIDE_LAB=1 bash /opt/gateheal/lab/reset/reset_lab.sh"
-        echo "RESET_GUEST_OK: In-guest services reset to clean baseline."
-        ;;
-    stop-vm)
-        if [[ -f "$PID_FILE" ]]; then
-            kill "$(cat "$PID_FILE")" 2>/dev/null || true
-            for _ in $(seq 1 20); do
-                if ! kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-                    break
-                fi
-                sleep 0.2
-            done
-            rm -f "$PID_FILE"
-            echo "Stopped VM."
-        else
-            echo "No PID file at $PID_FILE."
-        fi
-        ;;
-    status)
-        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "RUNNING (PID $(cat "$PID_FILE"))"
-        else
-            echo "STOPPED"
-            exit 1
-        fi
-        ;;
-    *)
-        echo "Usage: $0 {bootstrap-base|build-golden|create-overlay|reset-overlay|boot-vm|wait-ssh|reset-guest|stop-vm|status}"
-        ;;
-esac
+## 3. Verified Mitigations vs. Known Limitations
+- **Verified in Automated Test Suite (`SIMULATED` & `LIVE_QEMU_KVM_GUEST`):**
+  - Closed `ActionId` enum lookup, strict unit regex (`^[a-z0-9_-]+\.service$`), inventory allowlisting, and `shell=False` argument vectors[cite: 6].
+  - Capability-bound `ExecutionController.execute()` with mandatory `expires_at_utc`, execution-time `PolicyEngine.evaluate()` re-verification, proposal/decision digest, and TOCTOU state-hash checks[cite: 6].
+  - Per-incident retry budgets (`incidents[incident_id]`) separated from persistent per-unit cooldowns and flap counters keyed by the mutated unit (`units[target_unit]`)[cite: 6].
+  - Independent multi-sample `OutcomeVerifier` soak polling (`verification_soak_sec` / `verification_poll_interval_sec`) detecting crash recurrence via `NRestarts`, `InvocationID`, `ExecMainStartTimestampMonotonic`, and `active -> failed -> active` state transitions; read-only diagnostic actions, `no_op`, and `abstain_and_escalate` skip the soak window (`samples_collected=1`)[cite: 6].
+  - Bounded `communicate(timeout=...)` and pipe closure after `os.killpg` so orphan grandchildren holding stdout/stderr pipes in a new session cannot hang the controller[cite: 6].
+  - Write-ahead (`"intent"` and `"completed"`) SHA-256 hash-chained audit logs with `.anchor` checkpoint persistence across log rotation[cite: 6].
+  - **Empirical systemd Conformance & Sudoers Negative Isolation (WP5):** Verified that `Restart=no` leaves `NRestarts=0` on `SIGKILL`, `InvocationID` and `ExecMainStartTimestampMonotonic` remain identical on `reload` and change on `restart`, `SIGKILL` yields `ActiveState=failed` and `Result=signal`, active restart terminates coupled workers while start-failed preserves them, unprivileged `ubuntu` reads unit properties and journals cleanly (`FACT_6`), `ExecStartPre` validation failures prevent service startup while preserving downstream workers (`FACT_7`), and all argument-injection / unapproved sudo subcommands fail with explicit sudo denial messages (`check_conformance.sh`)[cite: 6].
+- **Known Limitations:**
+  - **Best-Effort Log Redaction:** Regex-based secret redaction (`redact_secrets_text`) scrubs known credential formats (complete and head/tail-truncated PEM blocks, JWTs, GitHub PATs, AWS keys/secrets, Stripe/Slack tokens, Basic/Bearer headers, cookies, and URL credentials), but cannot guarantee redaction of arbitrary custom or unformatted secrets[cite: 6].
+  - **Unkeyed Audit Hash Chain:** Without an external HMAC key (`GATEHEAL_AUDIT_HMAC_KEY`) stored outside the controller's writable directory, SHA-256 hash chaining is tamper-evident only against accidental corruption or truncation; a local attacker with write access to the log files can recompute unkeyed hashes[cite: 6].
+  - **Single-Process Prototype Key Storage:** In this prototype, the capability secret and `GATEHEAL_APPROVAL_HMAC_KEY` reside in the same OS process memory space as the controller[cite: 6].
+  - **Active-Session Coupling vs. `systemd` `PartOf=` / `BindsTo=` Coupling Limitation:** GateHeal's blast-radius model assumes starting a non-active (`failed`/`inactive`) unit has $B_{\text{dep}} = 0.0$ because no live process on the target is terminated[cite: 6]. If a downstream unit uses `PartOf=` or `BindsTo=` in `systemd`, restarting a `failed` upstream unit can still trigger `systemd` to stop/restart the downstream unit unless that systemd-level propagation is encoded in the inventory[cite: 6]. Therefore, `lab/systemd/lab-worker.service` uses `Wants=lab-api.service` rather than `BindsTo=` or `PartOf=`, and in the lab daemons (`lab_daemons.py`), `lab-api`'s `SIGTERM` handler notifies `lab-worker` when an active `lab-api` is hard-restarted (breaking `lab-worker` on an active restart in `S5`/`S5B`/`S2` while preserving `lab-worker` on `SIGHUP` reload or `S1` `SIGKILL` crash recovery)[cite: 6].
+  - **Real-Lab VM Execution:** Full end-to-end execution against a live QEMU/KVM guest (`--transport ssh`) requires a booted guest image with `lab/systemd/gateheal-sudoers.conf` installed at `/etc/sudoers.d/gateheal-lab`[cite: 6].
+  - **Cross-Incident Restart Bounds:** Because `prior_recovery_attempts` and `action_history` are scoped per `incident_id` (R4), repeated mutating actions across distinct `incident_id`s are bounded **only** by the per-unit `cooldown_sec` and `flap_max_restarts` / `flap_window_sec` limits[cite: 6].
+  - **Strict All-Samples-Healthy Soak Rule vs. Slow Startup Grace (D2):** During post-action verification, `OutcomeVerifier` enforces a strict rule requiring **every** soak sample $1 \dots N$ (starting at $t_1 = \text{verification\_poll\_interval\_sec}$) to be healthy (`active`/`running` and probe passing), rather than excusing unhealthy early soak samples under `startup_grace_sec`[cite: 6]. This deliberately trades potential false escalations on slow-starting services for fail-safe assurance[cite: 6].
+  - **In-Window Soak Unavailability vs. End-to-End MTTR (D3):** `VerificationReport.measured_unavailability_sec` (`in_window_unavailability_sec`) measures only in-window unavailability during the post-action soak window at poll-interval granularity (an upper bound)[cite: 6]. End-to-end MTTR comes from the experiment harness (`TrialOutcome.service_unavailability_sec`), not from `VerificationReport`[cite: 6].
+  - **Manual Restart Resets `NRestarts` & Sub-Interval Crash-Before-First-Sample Gap (D4):** Empirical guest probing (`FACT_5B_MANUAL_RESTART_NRESTARTS` in `check_conformance.sh`, recorded in `nrestarts_manual_restart_observation`) demonstrates that after an automatic `Restart=on-failure` increments `NRestarts=1`, issuing a manual `systemctl restart` resets `NRestarts=0` (`observed=reset`) once the unit stays up past the restart interval (`1.0` s). Furthermore, because `systemctl restart` legitimately replaces `InvocationID` and `ExecMainStartTimestampMonotonic` relative to `pre_incident`, if a restarted service crashes and is respawned *before* the first soak sample ($t < t_1$) without leaving `NRestarts > 0`, comparing sample 1 to `pre_incident` cannot distinguish that sub-interval crash from the requested restart; detection relies on `NRestarts` or recurrence across samples $1 \dots N$[cite: 6].
+  - **Shared Transport/Mechanism Between Collector and Verifier Oracle (D5):** Although `OutcomeVerifier` maintains a separate code path (`_probe_unit_oracle`) and never calls `IncidentCollector` or `DiagnosisEngine`, both query `systemctl show`, `curl`, and `gateheal.lab_daemons --check-tcp` over the same `CommandTransport`[cite: 6]. A stronger application-level oracle can additionally parse and compare the JSON `"boot_id"` / `"reload_count"` fields returned by `GET /healthz`[cite: 6].
+  - **Unauthenticated Local Worker Abort Frame in Lab Daemon (D6):** In `gateheal.lab_daemons`, `lab-worker` accepts the `API_HARD_RESTART` termination frame from any local process connecting to `127.0.0.1:8081` without authentication[cite: 6]. This is a lab-only fault/collateral simulation hook and not a hardened IPC protocol[cite: 6].
 ````
 
 ## File: src/gateheal/cli.py
@@ -14689,6 +13439,679 @@ class SimulatedLabTransport:
         )
 ````
 
+## File: tests/lab/test_wp5_collector_on_real_fixtures.py
+````python
+"""F3: Offline test on real captured VM fixtures using IncidentCollector plus DiagnosisEngine."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
+
+from gateheal.collector import IncidentCollector
+from gateheal.config import load_config
+from gateheal.diagnosis import DiagnosisEngine
+from gateheal.lab_bringup import SmokeMatrixExpectation, build_wp5_smoke_expectations
+from gateheal.transport import TransportResult
+
+pytestmark = pytest.mark.lab
+
+
+def _int_from_mapping(
+    mapping: dict[str, object], key: str, default: int = 0
+) -> int:
+    raw = mapping.get(key, default)
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
+        return int(raw.strip())
+    return default
+
+
+class _FixtureCommandTransport:
+    """Transport keyed by argv returning captured raw outputs from real VM fixtures."""
+
+    def __init__(
+        self, shows: dict[str, object], probes: dict[str, object]
+    ) -> None:
+        self._shows = shows
+        self._probes = probes
+
+    def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
+        _ = timeout_sec
+        cmd = tuple(argv)
+        if cmd[:2] == ("cat", "/proc/uptime"):
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt=str(
+                    self._probes.get("uptime", "50000.0 40000.0\n")
+                ),
+            )
+        if cmd[:2] == ("systemctl", "show"):
+            u = cmd[2]
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt=str(self._shows[u]),
+            )
+        if "--validate-config" in cmd:
+            return TransportResult(
+                exit_code=_int_from_mapping(
+                    self._probes, "validate_config_exit", 0
+                ),
+                duration_sec=0.01,
+            )
+        if cmd[0] == "curl":
+            curl_out = str(self._probes.get("curl_healthz", ""))
+            is_http_200 = "HTTP=200" in curl_out or '"status": "ok"' in curl_out
+            return TransportResult(
+                exit_code=0 if is_http_200 else 22,
+                duration_sec=0.01,
+                stdout_excerpt=curl_out,
+            )
+        if "--check-tcp" in cmd:
+            port = cmd[-1]
+            key = "tcp_6379_exit" if port == "6379" else "tcp_8081_exit"
+            return TransportResult(
+                exit_code=_int_from_mapping(self._probes, key, 0),
+                duration_sec=0.01,
+            )
+        if cmd[0] == "journalctl":
+            unit_idx = cmd.index("-u") + 1 if "-u" in cmd else -1
+            unit = cmd[unit_idx] if 0 < unit_idx < len(cmd) else ""
+            jnl_out = (
+                str(self._probes.get("journal_api", ""))
+                if unit == "lab-api.service"
+                else ""
+            )
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt=jnl_out,
+            )
+        return TransportResult(exit_code=0, duration_sec=0.01)
+
+
+@pytest.mark.parametrize(
+    "exp",
+    build_wp5_smoke_expectations(),
+    ids=lambda e: e.scenario_id,
+)
+def test_wp5_collector_on_real_fixtures(exp: SmokeMatrixExpectation) -> None:
+    """F3: Feed captured VM outputs via IncidentCollector.collect_from_transport."""
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = load_config(repo_root / "configs" / "phase1_lab.yaml")
+    fixture_path = (
+        repo_root
+        / "tests"
+        / "lab"
+        / "fixtures"
+        / "vm_captured_systemd_facts.json"
+    )
+    assert fixture_path.is_file()
+
+    payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    raw_ver = payload.get("fixture_version", 1)
+    fix_ver = raw_ver if isinstance(raw_ver, int) else 1
+
+    scen_shows = payload.get("scenarios_systemctl_show", {})
+    scen_probes = payload.get("scenarios_probes", {})
+    assert isinstance(scen_shows, dict)
+    assert isinstance(scen_probes, dict)
+
+    scen_id = exp.scenario_id
+    if scen_id not in scen_shows or scen_id not in scen_probes:
+        if fix_ver >= 2:
+            pytest.fail(
+                f"Fixture v{fix_ver} is missing raw show/probe data for {scen_id}"
+            )
+        pytest.skip(
+            f"Fixture v{fix_ver} lacks raw show/probe capture for {scen_id}; "
+            "re-capture with wp5_capture_and_verify.py"
+        )
+
+    unit_map = scen_shows[scen_id]
+    probes = scen_probes[scen_id]
+    assert isinstance(unit_map, dict)
+    assert isinstance(probes, dict)
+
+    transport = _FixtureCommandTransport(unit_map, probes)
+    collector = IncidentCollector(cfg)
+    diagnosis_engine = DiagnosisEngine(cfg)
+
+    incident = collector.collect_from_transport(
+        incident_id=f"replay-{scen_id.lower()}",
+        target_unit="lab-api.service",
+        transport=transport,
+        prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+        action_history=exp.seed_action_history,
+    )
+    diag = diagnosis_engine.diagnose(incident)
+    assert diag.fault_class in exp.expected_fault_classes, (
+        f"Scenario {scen_id} diagnosed {diag.fault_class}, "
+        f"expected one of {exp.expected_fault_classes}"
+    )
+````
+
+## File: tests/lab/test_wp5_real_lab.py
+````python
+"""WP5 real-lab conformance, sudoers negative, latency/soak, S0-S5B smoke, and manifest tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from gateheal.collector import (
+    IncidentCollector,
+    parse_invocation_and_start_usec,
+    parse_systemctl_show,
+)
+from gateheal.config import GateHealConfig, load_config
+from gateheal.controller import AuditRecorder, EscalationSink, default_artifacts_dir
+from gateheal.lab_bringup import (
+    LabRunManifest,
+    SmokeScenarioRunResult,
+    build_lab_run_manifest,
+    build_wp5_smoke_expectations,
+    compute_file_sha256,
+    measure_transport_latency,
+    parse_conformance_output,
+)
+from gateheal.models import ActionId
+from gateheal.orchestrator import IncidentOrchestrator
+from gateheal.policy import mint_approval_token
+from gateheal.state import PersistentStateStore
+from gateheal.transport import (
+    RecordingTransport,
+    SSHLabTransport,
+    TransportResult,
+    TransportUnavailableError,
+)
+
+pytestmark = pytest.mark.lab
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_cfg() -> GateHealConfig:
+    return load_config(_repo_root() / "configs" / "phase1_lab.yaml")
+
+
+def _load_fixture_json() -> dict[str, object]:
+    fix_path = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "vm_captured_systemd_facts.json"
+    )
+    raw = json.loads(fix_path.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    return raw
+
+
+def _fixture_version(fixture: dict[str, object]) -> int:
+    raw_ver = fixture.get("fixture_version", 1)
+    return raw_ver if isinstance(raw_ver, int) else 1
+
+
+class _FixtureReplayTransport:
+    """Scripted offline replay transport using VM-captured `systemctl show` fixtures."""
+
+    def __init__(self, shows: dict[str, object], scen: str) -> None:
+        self._shows = shows
+        self._scen = scen
+        self.mutated = False
+
+    def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
+        _ = timeout_sec
+        cmd = tuple(argv)
+        if cmd[:2] == ("cat", "/proc/uptime"):
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt="50000.0 40000.0\n",
+            )
+        if cmd[:3] == ("sudo", "-n", "/usr/bin/systemctl"):
+            self.mutated = True
+            return TransportResult(exit_code=0, duration_sec=0.02)
+        if cmd[:2] == ("systemctl", "show"):
+            u = cmd[2]
+            if (
+                self._scen == "S5B_COLLATERAL_FORCED_RESTART"
+                and u == "lab-worker.service"
+                and self.mutated
+            ):
+                return TransportResult(
+                    exit_code=0,
+                    duration_sec=0.01,
+                    stdout_excerpt=(
+                        "ActiveState=failed\nSubState=failed\nResult=exit-code\n"
+                        "NRestarts=0\nCanReload=no\n"
+                        "ActiveEnterTimestampMonotonic=10000000\n"
+                        "InvocationID=workerold1111\n"
+                        "ExecMainStartTimestampMonotonic=10000000\n"
+                    ),
+                )
+            if self.mutated and self._scen != "S5_COLLATERAL_TRAP":
+                return TransportResult(
+                    exit_code=0,
+                    duration_sec=0.01,
+                    stdout_excerpt=(
+                        "ActiveState=active\nSubState=running\nResult=success\n"
+                        "NRestarts=0\nCanReload=yes\n"
+                        "ActiveEnterTimestampMonotonic=50000000\n"
+                        "InvocationID=ddddeeeeffff00001111222233334444\n"
+                        "ExecMainStartTimestampMonotonic=45000000\n"
+                    ),
+                )
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt=str(self._shows[u]),
+            )
+        if "--validate-config" in cmd:
+            is_bad_cfg = self._scen in (
+                "S2_INVALID_CONFIG",
+                "S4_PERSISTENT_FAILURE",
+            )
+            return TransportResult(
+                exit_code=65 if is_bad_cfg else 0,
+                duration_sec=0.01,
+            )
+        if cmd[0] == "curl":
+            if self.mutated or self._scen in (
+                "S2_INVALID_CONFIG",
+                "S0_HEALTHY_CONTROL",
+            ):
+                return TransportResult(exit_code=0, duration_sec=0.01)
+            return TransportResult(exit_code=22, duration_sec=0.01)
+        if "--check-tcp" in cmd:
+            port = cmd[-1]
+            if (
+                port == "6379"
+                and self._scen == "S3_DEPENDENCY_FAILURE"
+                and not self.mutated
+            ):
+                return TransportResult(exit_code=1, duration_sec=0.01)
+            if (
+                port == "8081"
+                and self._scen == "S5B_COLLATERAL_FORCED_RESTART"
+                and self.mutated
+            ):
+                return TransportResult(exit_code=1, duration_sec=0.01)
+            return TransportResult(exit_code=0, duration_sec=0.01)
+        return TransportResult(exit_code=0, duration_sec=0.01)
+
+
+def test_wp5_conformance_script_and_fixture_facts_cover_all_five_systemd_invariants() -> None:
+    """Verify check_conformance.sh and captured fixture cover systemd facts and sudoers."""
+    script_path = _repo_root() / "lab" / "scripts" / "check_conformance.sh"
+    assert script_path.is_file()
+    script_text = script_path.read_text(encoding="utf-8")
+
+    required_script_ids = (
+        "FACT_1_RESTART_NO_NRESTARTS_ZERO",
+        "FACT_2_INVOCATION_ID_RESTART_VS_RELOAD",
+        "FACT_3_SIGKILL_RESULT_SIGNAL",
+        "FACT_4A_ACTIVE_API_RESTART_KILLS_WORKER",
+        "FACT_4B_START_FAILED_API_PRESERVES_WORKER",
+        "FACT_5B_MANUAL_RESTART_NRESTARTS",
+        "SUDO_POS_RELOAD_API",
+        "SUDO_POS_RESTART_REDIS",
+        "SUDO_POS_RESTART_API",
+        "SUDO_POS_RESTART_WORKER",
+        "SUDO_NEG_DENIED",
+        "FACT_6_UBUNTU_UNPRIVILEGED_READS",
+        "FACT_7_EXECSTARTPRE_FAILURE",
+    )
+    for fact_id in required_script_ids:
+        assert fact_id in script_text
+
+    fixture = _load_fixture_json()
+    fix_ver = _fixture_version(fixture)
+    raw_facts = fixture["conformance_facts"]
+    assert isinstance(raw_facts, list)
+    seen_ids = {
+        str(item["fact_id"]) for item in raw_facts if isinstance(item, dict)
+    }
+
+    if fix_ver >= 2:
+        for fact_id in required_script_ids:
+            assert fact_id in seen_ids
+        for fid in seen_ids:
+            if fid != "SSH_NEG_CONTROLLER_KEY_DENIED_ROOT":
+                assert fid in script_text
+    else:
+        v1_required = (
+            "FACT_1_RESTART_NO_NRESTARTS_ZERO",
+            "FACT_2_INVOCATION_ID_RESTART_VS_RELOAD",
+            "FACT_3_SIGKILL_RESULT_SIGNAL",
+            "FACT_4A_ACTIVE_API_RESTART_KILLS_WORKER",
+            "FACT_4B_START_FAILED_API_PRESERVES_WORKER",
+            "SUDO_POS_RELOAD_API",
+            "SUDO_NEG_DENIED",
+        )
+        for fact_id in v1_required:
+            assert fact_id in seen_ids
+
+    sample_stdout = (
+        "PASS: FACT_1_RESTART_NO_NRESTARTS_ZERO :: ActiveState=failed, NRestarts=0\n"
+        "FAIL: SUDO_NEG_DENIED :: Unapproved command succeeded\n"
+    )
+    parsed = parse_conformance_output(sample_stdout)
+    assert len(parsed) == 2
+    assert parsed[0].fact_id == "FACT_1_RESTART_NO_NRESTARTS_ZERO"
+    assert parsed[0].passed is True
+    assert parsed[1].fact_id == "SUDO_NEG_DENIED"
+    assert parsed[1].passed is False
+
+
+def test_wp5_sudoers_negative_commands_are_strictly_outside_allowlist() -> None:
+    """Verify every negative and argument-injection command is rejected by sudoers."""
+    sudoers_path = _repo_root() / "lab" / "systemd" / "gateheal-sudoers.conf"
+    prefix = "ubuntu ALL=(root) NOPASSWD: "
+    allowed_tuples = {
+        tuple(shlex.split(ln.strip()[len(prefix) :]))
+        for ln in sudoers_path.read_text(encoding="utf-8").splitlines()
+        if ln.strip().startswith(prefix)
+    }
+    assert len(allowed_tuples) == 4
+
+    denied_candidates = (
+        ("/usr/bin/systemctl", "stop", "lab-api.service"),
+        ("/usr/bin/systemctl", "reload", "lab-redis.service"),
+        ("/usr/bin/systemctl", "reload", "lab-worker.service"),
+        ("/usr/bin/systemctl", "restart", "ssh.service"),
+        ("/usr/bin/systemctl", "daemon-reload"),
+        ("/bin/sh", "-c", "id"),
+        ("/usr/bin/systemctl", "restart", "lab-api.service", "ssh.service"),
+        ("/usr/bin/systemctl", "restart", "lab-api.service", "--no-block"),
+        ("/usr/bin/systemctl", "restart", "lab-api.service", "lab-redis.service"),
+        ("/usr/bin/systemctl", "--no-block", "restart", "lab-api.service"),
+        ("/usr/bin/systemctl", "restart", "lab-api.service", "--", "--version"),
+        ("/usr/bin/systemctl", "kill", "lab-api.service"),
+        ("/usr/bin/systemctl", "start", "lab-api.service"),
+    )
+    for candidate in denied_candidates:
+        assert candidate not in allowed_tuples
+
+
+def test_wp5_latency_profiler_and_manifest_builder_with_captured_fixtures(
+    tmp_path: Path,
+) -> None:
+    """Scripted offline replay: verify latency profiler, S0-S5B fixture replay, and manifest."""
+    repo_root = _repo_root()
+    cfg = _load_cfg()
+    fixture = _load_fixture_json()
+    fix_ver = _fixture_version(fixture)
+    scen_map = fixture["scenarios_systemctl_show"]
+    assert isinstance(scen_map, dict)
+
+    for scen_id, unit_map in scen_map.items():
+        assert isinstance(unit_map, dict), scen_id
+        for u_name, show_str in unit_map.items():
+            assert u_name in cfg.inventory.services
+            props = parse_systemctl_show(str(show_str))
+            inv, st_usec = parse_invocation_and_start_usec(props)
+            assert inv is not None
+            assert st_usec is not None and st_usec > 0
+
+    clock_ticks = [0.0]
+
+    def fake_clock() -> float:
+        clock_ticks[0] += 0.012
+        return clock_ticks[0]
+
+    class _FastTransport:
+        def run(self, argv: Sequence[str], timeout_sec: float) -> TransportResult:
+            _ = (argv, timeout_sec)
+            return TransportResult(
+                exit_code=0,
+                duration_sec=0.01,
+                stdout_excerpt="systemd 255\n",
+            )
+
+    latency = measure_transport_latency(
+        _FastTransport(), samples=10, monotonic_clock=fake_clock
+    )
+    assert latency.samples == 10
+    assert latency.min_ms == pytest.approx(12.0)
+    assert latency.p95_ms == pytest.approx(12.0)
+
+    smoke_runs: list[SmokeScenarioRunResult] = []
+    missing_scenarios: list[str] = []
+    now_dt = datetime(2026, 10, 24, 8, 0, 0, tzinfo=UTC)
+    test_hmac_key = b"dev-operator-hmac-secret-key-32bytes-long!!"
+
+    for exp in build_wp5_smoke_expectations():
+        if exp.scenario_id not in scen_map:
+            missing_scenarios.append(exp.scenario_id)
+            continue
+
+        unit_shows = scen_map[exp.scenario_id]
+        assert isinstance(unit_shows, dict)
+        soak_step = [0]
+
+        def _mono(_s: list[int] = soak_step) -> float:
+            return float(_s[0])
+
+        def _sleep(sec: float, _s: list[int] = soak_step) -> None:
+            _s[0] += int(sec)
+
+        inc_id = f"wp5-replay-{exp.scenario_id.lower()}"
+        store = PersistentStateStore(tmp_path / f"{inc_id}.json")
+        store.seed_unit_state(
+            "lab-api.service",
+            incident_id=inc_id,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+
+        approval_token = None
+        if exp.requires_approval_token:
+            pre_collector = IncidentCollector(
+                cfg, clock_utc=lambda: now_dt
+            )
+            pre_inc = pre_collector.collect_from_transport(
+                incident_id=inc_id,
+                target_unit="lab-api.service",
+                transport=_FixtureReplayTransport(unit_shows, exp.scenario_id),
+            )
+            approval_token = mint_approval_token(
+                token_id=f"tok-replay-{exp.scenario_id.lower()}",
+                incident=pre_inc,
+                config=cfg,
+                action_id=ActionId.RESTART_SERVICE.value,
+                target_unit="lab-api.service",
+                expires_at_utc="2099-01-01T00:00:00Z",
+                hmac_key=test_hmac_key,
+            )
+
+        rec_transport = RecordingTransport(
+            _FixtureReplayTransport(unit_shows, exp.scenario_id)
+        )
+        orch = IncidentOrchestrator(
+            cfg,
+            transport=rec_transport,
+            audit_recorder=AuditRecorder(
+                tmp_path / f"{inc_id}_audit.jsonl", clock_utc=lambda: now_dt
+            ),
+            escalation_sink=EscalationSink(tmp_path / f"{inc_id}_esc.jsonl"),
+            state_store=store,
+            clock_utc=lambda: now_dt,
+            monotonic_clock=_mono,
+            sleep_fn=_sleep,
+        )
+        if exp.requires_approval_token:
+            orch.policy_engine._hmac_key_loader = lambda: test_hmac_key
+
+        audit = orch.handle_incident(
+            incident_id=inc_id,
+            target_unit="lab-api.service",
+            approval_token=approval_token,
+        )
+        assert audit.selected_proposal is not None
+        assert audit.verification_report is not None
+        sel = audit.selected_proposal
+        ver = audit.verification_report
+        mut_count = rec_transport.mutating_commands_executed
+        matched = (
+            audit.diagnosis.fault_class in exp.expected_fault_classes
+            and sel.action_id == exp.expected_action_id.value
+            and sel.target_unit == exp.expected_target_unit
+            and ver.status == exp.expected_verification_status
+            and ver.collateral_failures == exp.expected_collateral_failures
+            and audit.escalated == exp.expected_escalated
+            and mut_count == exp.expected_mutating_commands
+        )
+        assert matched is True, f"Scenario {exp.scenario_id} failed expectation"
+        smoke_runs.append(
+            SmokeScenarioRunResult(
+                scenario_id=exp.scenario_id,
+                repeat_index=1,
+                diagnosed_fault=audit.diagnosis.fault_class,
+                selected_action_id=sel.action_id,
+                selected_target_unit=sel.target_unit,
+                verification_status=ver.status,
+                collateral_failures=ver.collateral_failures,
+                samples_collected=ver.samples_collected,
+                soak_wall_clock_sec=float(soak_step[0]),
+                soak_budget_ok=True,
+                ssh_command_count=rec_transport.ssh_command_count,
+                mutating_commands_executed=mut_count,
+                escalated=audit.escalated,
+                matched_expectation=matched,
+            )
+        )
+
+    if missing_scenarios:
+        if fix_ver >= 2:
+            pytest.fail(
+                f"Fixture v{fix_ver} is missing required scenarios: {missing_scenarios}"
+            )
+        pytest.skip(
+            f"Fixture v{fix_ver} lacks scenarios {missing_scenarios}; "
+            "re-capture from live VM with wp5_capture_and_verify.py"
+        )
+
+    manifest = build_lab_run_manifest(
+        repo_root=repo_root,
+        config_path=repo_root / "configs" / "phase1_lab.yaml",
+        sudoers_path=repo_root / "lab" / "systemd" / "gateheal-sudoers.conf",
+        ssh_latency=latency,
+        conformance_facts=parse_conformance_output(
+            "PASS: FACT_1_RESTART_NO_NRESTARTS_ZERO :: ok\n"
+        ),
+        smoke_matrix=smoke_runs,
+        clock_utc=lambda: now_dt,
+    )
+    assert manifest.conformance_all_passed is True
+    assert manifest.smoke_all_passed is True
+    assert len(manifest.config_sha256) == 64
+    assert len(manifest.sudoers_sha256) == 64
+
+
+@pytest.mark.skipif(
+    os.environ.get("GATEHEAL_RUN_LAB_TESTS") != "1",
+    reason=(
+        "Set GATEHEAL_RUN_LAB_TESTS=1 with booted QEMU/KVM guest on "
+        "127.0.0.1:2222"
+    ),
+)
+def test_wp5_live_vm_ssh_conformance_and_captured_fixture_freshness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live VM check (Spec G): validate manifest, hashes, kernel, and root key denial."""
+    repo_root = _repo_root()
+    monkeypatch.delenv("GATEHEAL_ARTIFACTS_DIR", raising=False)
+    manifest_path = default_artifacts_dir() / "wp5_lab_manifest.json"
+    if not manifest_path.is_file():
+        pytest.fail(
+            f"Runbook pointer (docs/lab-runbook.md ## Troubleshooting): "
+            f"Missing live manifest at {manifest_path}; "
+            "run python lab/scripts/wp5_capture_and_verify.py first."
+        )
+    manifest = LabRunManifest.model_validate_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest.conformance_all_passed is True
+    assert manifest.smoke_all_passed is True
+    assert manifest.soak_budget_ok is True
+    assert manifest.controller_key_root_login_denied is True
+
+    expected_scen_ids = {e.scenario_id for e in build_wp5_smoke_expectations()}
+    assert len(expected_scen_ids) == 7
+    assert {s.scenario_id for s in manifest.smoke_matrix} == expected_scen_ids
+    assert len(manifest.smoke_matrix) == 7 * manifest.repeats
+
+    cfg_path = repo_root / "configs" / "phase1_lab.yaml"
+    sudoers_path = repo_root / "lab" / "systemd" / "gateheal-sudoers.conf"
+    assert manifest.config_sha256 == compute_file_sha256(cfg_path)
+    assert manifest.sudoers_sha256 == compute_file_sha256(sudoers_path)
+
+    fixture = _load_fixture_json()
+    assert _fixture_version(fixture) >= 2
+    assert manifest.guest_kernel == fixture["guest_kernel"]
+    assert manifest.guest_systemd_version == fixture["guest_systemd_version"]
+
+    ssh_port = int(os.environ.get("GATEHEAL_LAB_SSH_PORT", "2222"))
+    ssh_user = os.environ.get("GATEHEAL_LAB_SSH_USER", "ubuntu")
+    default_key = Path.home() / ".cache" / "gateheal-vm" / "id_ed25519"
+    ssh_key = os.environ.get("GATEHEAL_LAB_SSH_KEY") or (
+        str(default_key) if default_key.is_file() else None
+    )
+    transport = SSHLabTransport(
+        host="127.0.0.1",
+        port=ssh_port,
+        user=ssh_user,
+        identity_file=ssh_key,
+        use_remote_timeout=True,
+        verify_remote_sentinel=True,
+    )
+    try:
+        latency = measure_transport_latency(transport, samples=5)
+        assert latency.max_ms < 5000.0
+        uname_res = transport.run(("uname", "-r"), timeout_sec=5.0)
+        sysd_res = transport.run(("systemctl", "--version"), timeout_sec=5.0)
+    except TransportUnavailableError as exc:
+        pytest.fail(
+            f"Runbook pointer (docs/lab-runbook.md ## Troubleshooting): "
+            f"Live SSH transport unavailable: {exc}"
+        )
+
+    live_kernel = uname_res.stdout_excerpt.strip()
+    live_systemd = sysd_res.stdout_excerpt.splitlines()[0].strip()
+    assert live_kernel == manifest.guest_kernel
+    assert live_systemd == manifest.guest_systemd_version
+
+    root_with_controller_key = SSHLabTransport(
+        host="127.0.0.1",
+        port=ssh_port,
+        user="root",
+        identity_file=ssh_key,
+        use_remote_timeout=True,
+        verify_remote_sentinel=True,
+    )
+    with pytest.raises(TransportUnavailableError) as exc_info:
+        root_with_controller_key.run(("true",), timeout_sec=5.0)
+    assert exc_info.value.exit_code == 255
+````
+
 ## File: pyproject.toml
 ````toml
 [build-system]
@@ -14745,4 +14168,300 @@ addopts = "-q"
 markers = [
     "lab: real-lab QEMU/KVM guest verification and conformance tests",
 ]
+````
+
+## File: lab/qemu/manage_vm.sh
+````bash
+#!/usr/bin/env bash
+# Host-side helper to bootstrap, verify SHA256SUMS, sync/provision, build lab-golden.qcow2, and manage QEMU/KVM overlays.
+set -euo pipefail
+
+ACTION="${1:-help}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+VM_DIR="${GATEHEAL_VM_DIR:-$HOME/.cache/gateheal-vm}"
+BASE_IMAGE="${GATEHEAL_BASE_IMAGE:-${VM_DIR}/ubuntu-24.04-base.qcow2}"
+GOLDEN_IMAGE="${GATEHEAL_GOLDEN_IMAGE:-${VM_DIR}/ubuntu-24.04-golden.qcow2}"
+OVERLAY_IMAGE="${GATEHEAL_OVERLAY_IMAGE:-${VM_DIR}/lab-overlay.qcow2}"
+SEED_ISO="${VM_DIR}/seed.iso"
+SEED_HASH_FILE="${VM_DIR}/seed.hash"
+SSH_KEY="${GATEHEAL_LAB_SSH_KEY:-${VM_DIR}/id_ed25519}"
+HARNESS_KEY="${GATEHEAL_LAB_HARNESS_KEY:-${VM_DIR}/id_harness_ed25519}"
+KNOWN_HOSTS_FILE="${GATEHEAL_LAB_KNOWN_HOSTS:-${VM_DIR}/known_hosts}"
+PID_FILE="${VM_DIR}/qemu.pid"
+SSH_PORT="${GATEHEAL_LAB_SSH_PORT:-2222}"
+SHA256SUMS_FILE="${VM_DIR}/SHA256SUMS"
+PIN_FILE="${VM_DIR}/base.pin"
+RELEASE_FILE="${VM_DIR}/base_image_release"
+GUEST_REPO_DIR="${GATEHEAL_GUEST_REPO_DIR:-/opt/gateheal}"
+
+BASE_image_release="${GATEHEAL_CLOUD_RELEASE:-current}"
+CLOUD_RELEASE_URL="https://cloud-images.ubuntu.com/releases/noble/${BASE_image_release}"
+CLOUD_IMG_NAME="noble-server-cloudimg-amd64.img"
+
+mkdir -p "$VM_DIR"
+
+SSH_COMMON_OPTS=(
+    -p "$SSH_PORT"
+    -o BatchMode=yes
+    -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
+    -o StrictHostKeyChecking=accept-new
+    -o LogLevel=ERROR
+    -o IdentitiesOnly=yes
+    -o ConnectTimeout=5
+)
+
+ensure_keys() {
+    if [[ ! -f "$SSH_KEY" ]]; then
+        ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "gateheal-controller-ubuntu" >/dev/null
+        echo "Generated controller SSH key at $SSH_KEY"
+    fi
+    if [[ ! -f "$HARNESS_KEY" ]]; then
+        ssh-keygen -t ed25519 -N "" -f "$HARNESS_KEY" -C "gateheal-harness-root" >/dev/null
+        echo "Generated harness SSH key at $HARNESS_KEY"
+    fi
+}
+
+check_seed_iso() {
+    ensure_keys
+    local ud="${VM_DIR}/user-data"
+    local md="${VM_DIR}/meta-data"
+    local ctrl_pub harness_pub
+    ctrl_pub="$(cat "${SSH_KEY}.pub")"
+    harness_pub="$(cat "${HARNESS_KEY}.pub")"
+
+    cat <<YAML > "$ud"
+#cloud-config
+hostname: gateheal-lab
+disable_root: false
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin, sudo, systemd-journal, adm
+    home: /home/ubuntu
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${ctrl_pub}
+  - name: root
+    ssh_authorized_keys:
+      - ${harness_pub}
+ssh_pwauth: false
+package_update: false
+YAML
+
+    cat <<YAML > "$md"
+instance-id: gateheal-lab-01
+local-hostname: gateheal-lab
+YAML
+
+    local current_hash
+    current_hash="$(sha256sum "$ud" "${SSH_KEY}.pub" "${HARNESS_KEY}.pub" | sha256sum | awk '{print $1}')"
+    if [[ ! -f "$SEED_ISO" || ! -f "$SEED_HASH_FILE" || "$(cat "$SEED_HASH_FILE")" != "$current_hash" ]]; then
+        if command -v cloud-localds >/dev/null 2>&1; then
+            cloud-localds "$SEED_ISO" "$ud" "$md"
+        elif command -v xorriso >/dev/null 2>&1; then
+            xorriso -as mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
+        elif command -v genisoimage >/dev/null 2>&1; then
+            genisoimage -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
+        elif command -v mkisofs >/dev/null 2>&1; then
+            mkisofs -output "$SEED_ISO" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
+        elif command -v mkfs.vfat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
+            rm -f "$SEED_ISO"
+            mkfs.vfat -n cidata -C "$SEED_ISO" 2048 >/dev/null
+            mcopy -i "$SEED_ISO" "$ud" ::user-data
+            mcopy -i "$SEED_ISO" "$md" ::meta-data
+        else
+            echo "FATAL: Install xorriso, cdrtools, or mtools+dosfstools to build cloud-init seed." >&2
+            exit 1
+        fi
+        echo "$current_hash" > "$SEED_HASH_FILE"
+    fi
+}
+
+case "$ACTION" in
+    bootstrap-base)
+        ensure_keys
+        echo "$BASE_image_release" > "$RELEASE_FILE"
+        if [[ ! -f "$BASE_IMAGE" ]]; then
+            echo "Downloading Ubuntu 24.04 (${BASE_image_release}) cloud image and SHA256SUMS ..."
+            curl -fsSL "${CLOUD_RELEASE_URL}/SHA256SUMS" -o "$SHA256SUMS_FILE"
+            curl -fL "${CLOUD_RELEASE_URL}/${CLOUD_IMG_NAME}" -o "${VM_DIR}/${CLOUD_IMG_NAME}"
+            (
+                cd "$VM_DIR"
+                grep " \*${CLOUD_IMG_NAME}\$" "$SHA256SUMS_FILE" > "${SHA256SUMS_FILE}.target"
+                sha256sum -c "${SHA256SUMS_FILE}.target"
+            )
+            qemu-img resize "${VM_DIR}/${CLOUD_IMG_NAME}" 10G >/dev/null
+            mv "${VM_DIR}/${CLOUD_IMG_NAME}" "$BASE_IMAGE"
+            sha256sum "$BASE_IMAGE" | awk '{print $1}' > "$PIN_FILE"
+        else
+            if [[ ! -f "$PIN_FILE" ]]; then
+                sha256sum "$BASE_IMAGE" | awk '{print $1}' > "$PIN_FILE"
+            fi
+            current_actual="$(sha256sum "$BASE_IMAGE" | awk '{print $1}')"
+            pinned_expected="$(cat "$PIN_FILE")"
+            if [[ "$current_actual" != "$pinned_expected" ]]; then
+                echo "FATAL: Base image sha256 ($current_actual) does not match pin ($pinned_expected)." >&2
+                exit 1
+            fi
+        fi
+        check_seed_iso
+        echo "BOOTSTRAP_OK: Release=${BASE_image_release}, Base=${BASE_IMAGE}, ControllerKey=${SSH_KEY}, HarnessKey=${HARNESS_KEY}"
+        ;;
+    create-overlay|reset-overlay)
+        if [[ -f "$GOLDEN_IMAGE" ]]; then
+            BACKING="$GOLDEN_IMAGE"
+            echo "Creating overlay backed by provisioned golden image ($GOLDEN_IMAGE) ..."
+        elif [[ -f "$BASE_IMAGE" ]]; then
+            BACKING="$BASE_IMAGE"
+            echo "WARN: Creating overlay backed by raw base image ($BASE_IMAGE); run '$0 provision' after boot."
+        else
+            echo "FATAL: Base image not found at $BASE_IMAGE. Run '$0 bootstrap-base' first." >&2
+            exit 1
+        fi
+        rm -f "$OVERLAY_IMAGE" "$KNOWN_HOSTS_FILE"
+        qemu-img create -f qcow2 -b "$(realpath "$BACKING")" -F qcow2 "$OVERLAY_IMAGE" >/dev/null
+        echo "OVERLAY_OK: $OVERLAY_IMAGE -> $BACKING (cleared $KNOWN_HOSTS_FILE)"
+        ;;
+    sync-repo)
+        ensure_keys
+        mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
+        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
+            ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
+                "mkdir -p ${GUEST_REPO_DIR} && chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
+        elif ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "sudo -n true" >/dev/null 2>&1; then
+            ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
+                "sudo -n mkdir -p ${GUEST_REPO_DIR} && sudo -n chown -R ubuntu:ubuntu ${GUEST_REPO_DIR}"
+        fi
+        rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'artifacts' \
+            --exclude '.venv' \
+            --exclude '__pycache__' \
+            --exclude '.mypy_cache' \
+            --exclude '.pytest_cache' \
+            --exclude '.ruff_cache' \
+            -e "ssh -p ${SSH_PORT} -o BatchMode=yes -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o IdentitiesOnly=yes -i ${SSH_KEY}" \
+            "${REPO_ROOT}/" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/"
+        scp -P "$SSH_PORT" \
+            -o BatchMode=yes \
+            -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}" \
+            -o StrictHostKeyChecking=accept-new \
+            -o LogLevel=ERROR \
+            -o IdentitiesOnly=yes \
+            -i "$SSH_KEY" \
+            "${HARNESS_KEY}.pub" "ubuntu@127.0.0.1:${GUEST_REPO_DIR}/.harness_key.pub" >/dev/null
+        echo "SYNC_OK: Synced repo and harness public key to ubuntu@127.0.0.1:${GUEST_REPO_DIR}"
+        ;;
+    provision)
+        ensure_keys
+        "$0" sync-repo
+        if ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 "true" >/dev/null 2>&1; then
+            ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
+                "bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
+        else
+            ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 \
+                "sudo -n bash ${GUEST_REPO_DIR}/lab/scripts/provision_guest.sh"
+        fi
+        ;;
+    boot-vm)
+        ensure_keys
+        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            echo "VM already running (PID $(cat "$PID_FILE"))."
+            exit 0
+        fi
+        if [[ ! -f "$OVERLAY_IMAGE" ]]; then
+            "$0" create-overlay
+        fi
+        check_seed_iso
+        qemu-system-x86_64 \
+            -enable-kvm \
+            -cpu host \
+            -m 2048 \
+            -smp 2 \
+            -drive "file=${OVERLAY_IMAGE},format=qcow2,if=virtio" \
+            -drive "file=${SEED_ISO},format=raw,if=virtio,readonly=on" \
+            -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -pidfile "$PID_FILE" \
+            -daemonize
+        echo "Booted QEMU/KVM VM (PID $(cat "$PID_FILE")) with restrict=on on 127.0.0.1:${SSH_PORT}"
+        ;;
+    wait-ssh)
+        ensure_keys
+        mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
+        echo "Waiting for SSH on 127.0.0.1:${SSH_PORT} (known_hosts=${KNOWN_HOSTS_FILE}) ..."
+        for _ in $(seq 1 60); do
+            if ssh "${SSH_COMMON_OPTS[@]}" -i "$SSH_KEY" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
+                echo "SSH_READY on 127.0.0.1:${SSH_PORT}"
+                exit 0
+            fi
+            sleep 2
+        done
+        echo "FATAL: Timed out waiting for SSH on 127.0.0.1:${SSH_PORT}" >&2
+        exit 1
+        ;;
+    build-golden)
+        ensure_keys
+        if ! "$0" status >/dev/null 2>&1; then
+            "$0" boot-vm
+            "$0" wait-ssh
+        fi
+        "$0" provision
+        "$0" stop-vm
+        sleep 1
+        qemu-img convert -O qcow2 "$OVERLAY_IMAGE" "$GOLDEN_IMAGE"
+        qemu-img check "$GOLDEN_IMAGE"
+        "$0" create-overlay
+        echo "GOLDEN_OK: Saved provisioned golden image at $GOLDEN_IMAGE and created fresh overlay."
+        ;;
+    reset-guest)
+        ensure_keys
+        ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
+            "GATEHEAL_INSIDE_LAB=1 bash ${GUEST_REPO_DIR}/lab/reset/reset_lab.sh"
+        echo "RESET_GUEST_OK: In-guest services reset to clean baseline."
+        ;;
+    stop-vm)
+        if [[ -f "$PID_FILE" ]]; then
+            pid="$(cat "$PID_FILE")"
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Attempting graceful poweroff inside VM..."
+                ssh "${SSH_COMMON_OPTS[@]}" -i "$HARNESS_KEY" root@127.0.0.1 \
+                    "sync; systemctl poweroff" >/dev/null 2>&1 || true
+                for _ in $(seq 1 30); do
+                    if ! kill -0 "$pid" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+            fi
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Graceful shutdown timed out; terminating QEMU (PID $pid)..."
+                kill "$pid" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                    if ! kill -0 "$pid" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 0.2
+                done
+            fi
+            rm -f "$PID_FILE"
+            echo "Stopped VM."
+        else
+            echo "No PID file at $PID_FILE."
+        fi
+        ;;
+    status)
+        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            echo "RUNNING (PID $(cat "$PID_FILE"))"
+        else
+            echo "STOPPED"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {bootstrap-base|create-overlay|reset-overlay|boot-vm|wait-ssh|sync-repo|provision|build-golden|reset-guest|stop-vm|status}"
+        ;;
+esac
 ````
