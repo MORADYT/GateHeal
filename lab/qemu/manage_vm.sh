@@ -18,6 +18,7 @@ PID_FILE="${VM_DIR}/qemu.pid"
 SSH_PORT="${GATEHEAL_LAB_SSH_PORT:-2222}"
 SHA256SUMS_FILE="${VM_DIR}/SHA256SUMS"
 PIN_FILE="${VM_DIR}/base.pin"
+UPSTREAM_SHA_FILE="${VM_DIR}/base.upstream.sha256"
 RELEASE_FILE="${VM_DIR}/base_image_release"
 GUEST_REPO_DIR="${GATEHEAL_GUEST_REPO_DIR:-/opt/gateheal}"
 
@@ -119,6 +120,7 @@ case "$ACTION" in
                 cd "$VM_DIR"
                 grep " \*${CLOUD_IMG_NAME}\$" "$SHA256SUMS_FILE" > "${SHA256SUMS_FILE}.target"
                 sha256sum -c "${SHA256SUMS_FILE}.target"
+                awk '{print $1}' "${SHA256SUMS_FILE}.target" > "$UPSTREAM_SHA_FILE"
             )
             qemu-img resize "${VM_DIR}/${CLOUD_IMG_NAME}" 10G >/dev/null
             mv "${VM_DIR}/${CLOUD_IMG_NAME}" "$BASE_IMAGE"

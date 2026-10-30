@@ -527,17 +527,17 @@ def main(argv: list[str] | None = None) -> int:
     default_vm_dir = str(Path.home() / ".cache" / "gateheal-vm")
     vm_dir = Path(os.environ.get("GATEHEAL_VM_DIR", default_vm_dir))
     release_file = vm_dir / "base_image_release"
-    pin_file = vm_dir / "base.pin"
+    upstream_file = vm_dir / "base.upstream.sha256"
     recorded_release = (
         release_file.read_text(encoding="utf-8").strip()
         if release_file.is_file()
         else DEFAULT_PINNED_UBUNTU_RELEASE
     )
     recorded_upstream_sha: str | None = None
-    if pin_file.is_file():
-        pin_tokens = pin_file.read_text(encoding="utf-8").split()
-        if pin_tokens:
-            recorded_upstream_sha = pin_tokens[-1].strip()
+    if upstream_file.is_file():
+        upstream_tokens = upstream_file.read_text(encoding="utf-8").split()
+        if upstream_tokens:
+            recorded_upstream_sha = upstream_tokens[0].strip()
 
     manifest = build_lab_run_manifest(
         repo_root=repo_root,
