@@ -285,7 +285,10 @@ class WP6ReportGenerator:
                 "Diff (A-B) | McNemar p (raw) | Holm p (adj) | Rejected | "
                 "Wilcoxon p | Bootstrap Unavail Diff [95% CI] |"
             ),
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            (
+                "| :--- | :---: | :---: | :---: | :---: | "
+                "| :---: | :---: | :---: | :---: | :---: | :---: |"
+            ),
         ])
         for comp in self._summary.paired_comparisons:
             h_item = holm_map.get(comp.comparison_id)

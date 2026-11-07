@@ -64,6 +64,10 @@ GATEHEAL_ARMS: frozenset[str] = frozenset({"G", "G-nobr", "G-nosoak"})
 H2_NON_INFERIORITY_MARGIN = 0.05
 
 
+def _default_utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 class WP6TrialRecord(BaseModel):
     """Single append-only JSONL record for one (scenario_id, repeat_index, arm_id) trial."""
 
@@ -345,7 +349,7 @@ class WP6ExperimentRunner:
         self._pre_state_timeout_sec = pre_state_timeout_sec
         self._verbose_progress = verbose_progress
         self._clock_utc: Callable[[], datetime] = (
-            (lambda: datetime.now(UTC)) if clock_utc is None else clock_utc
+            _default_utc_now if clock_utc is None else clock_utc
         )
         self._monotonic_clock: Callable[[], float] = (
             time.monotonic if monotonic_clock is None else monotonic_clock
@@ -634,7 +638,9 @@ def build_wp6_campaign_manifest(
     clock_utc: Callable[[], datetime] | None = None,
 ) -> WP6CampaignManifest:
     """Validate preflight and build a WP6CampaignManifest."""
-    now_fn = (lambda: datetime.now(UTC)) if clock_utc is None else clock_utc
+    now_fn: Callable[[], datetime] = (
+        _default_utc_now if clock_utc is None else clock_utc
+    )
     wp5_manifest, wp5_hash, git_sha, git_dirty = validate_wp6_preflight(
         repo_root=repo_root,
         wp5_manifest_path=wp5_manifest_path,
@@ -675,7 +681,9 @@ def summarize_wp6_campaign(
     clock_utc: Callable[[], datetime] | None = None,
 ) -> WP6CampaignSummary:
     """Compute unconditional arm rates, coverage tables, paired tests, and Holm p-values."""
-    now_fn = (lambda: datetime.now(UTC)) if clock_utc is None else clock_utc
+    now_fn: Callable[[], datetime] = (
+        _default_utc_now if clock_utc is None else clock_utc
+    )
     scen_list = (
         tuple(SCENARIO_RECOVERABLE.keys())
         if scenarios is None
