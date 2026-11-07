@@ -630,7 +630,15 @@ class IndependentLabOracle:
         immediate_post = self.capture_snapshot("immediate_post")
         self._sleep(self._hold_window_sec)
         hold_post = self.capture_snapshot("hold_post")
-        recoverable = SCENARIO_RECOVERABLE.get(scenario_id, True)
+        recoverable = (
+            False
+            if scenario_id in (
+                "S2_INVALID_CONFIG",
+                "S4_PERSISTENT_FAILURE",
+                "S5B_COLLATERAL_FORCED_RESTART",
+            )
+            else SCENARIO_RECOVERABLE.get(scenario_id, True)
+        )
         all_units = (
             "lab-redis.service",
             "lab-api.service",
