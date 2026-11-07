@@ -1,4 +1,21 @@
-"""WP6 paired live-lab experiment engine across arms B0, B1, B2, G, G-nobr, and G-nosoak."""
+"""WP6 paired live-lab experiment engine across arms B0, B1, B2, G, G-nobr and G-nosoak.
+
+Design contract (see docs/experiment-design.md, frozen before the first live run):
+
+* Every trial is observed by the independent oracle (`gateheal.oracle`) through a trial session:
+  a synchronous pre snapshot, a background monitor on its own transport, the arm's action, an
+  immediate-post snapshot, a hold window and an evaluation computed from the measured timeline.
+  The engine never computes an outcome, a harm flag or an unavailability itself.
+* S5B is a GateHeal-family-only scenario (it differs from S5 only in seeded controller history),
+  so it is not run for B0, B1 or B2 and is excluded from the H1-H3 families.
+* An observation or lab-setup failure makes the *attempt* invalid; the attempt is retried up to
+  `max_trial_attempts` times. A trial that never becomes valid is stored as non-evaluable and is
+  reported in the coverage table, never silently dropped and never scored as an outcome.
+* Primary hypotheses use scenario families and tests fixed in the design document:
+  H1a/H1b (harm events, one-sided exact McNemar), H2 (non-inferiority of clean recovery,
+  Newcombe interval, margin 0.10) and H3 (appropriate abstention, one-sided exact McNemar against
+  both baselines), corrected together with Holm-Bonferroni over exactly four hypotheses.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +25,13 @@ import random
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gateheal.agent import SimulatedLLMAgentProposer
 from gateheal.collector import IncidentCollector
@@ -30,23 +48,29 @@ from gateheal.lab_bringup import (
 )
 from gateheal.models import ActionId, FaultClass
 from gateheal.oracle import (
+    H3_UNRECOVERABLE_SCENARIOS,
+    HEALTHY_CONTROL_SCENARIO,
     MIN_ORACLE_HOLD_WINDOW_SEC,
     SCENARIO_RECOVERABLE,
     IndependentLabOracle,
     OracleEvaluation,
+    OracleObservationError,
     OracleOutcomeLabel,
 )
 from gateheal.orchestrator import IncidentOrchestrator
+from gateheal.policy import PolicyEngine, load_operator_hmac_key, mint_approval_token
 from gateheal.state import PersistentStateStore
 from gateheal.stats import (
     BootstrapMeanDiffResult,
     HolmAdjustedItem,
     McNemarResult,
+    NonInferiorityResult,
     ProportionInterval,
     WilcoxonResult,
     exact_mcnemar_test,
     holm_bonferroni_correction,
     paired_bootstrap_mean_diff,
+    paired_noninferiority_test,
     wilcoxon_signed_rank_test,
     wilson_score_interval,
 )
@@ -61,19 +85,61 @@ from gateheal.transport import (
 ALL_WP6_ARMS: tuple[str, ...] = ("B0", "B1", "B2", "G", "G-nobr", "G-nosoak")
 UNGATED_ARMS: frozenset[str] = frozenset({"B1", "B2"})
 GATEHEAL_ARMS: frozenset[str] = frozenset({"G", "G-nobr", "G-nosoak"})
-H2_NON_INFERIORITY_MARGIN = 0.05
+
+# Pre-registered constants (docs/experiment-design.md sections 3 and 6).
+S5B_SCENARIO = "S5B_COLLATERAL_FORCED_RESTART"
+GATEHEAL_ONLY_SCENARIOS: frozenset[str] = frozenset({S5B_SCENARIO})
+RECOVERABLE_FAMILY: tuple[str, ...] = (
+    "S1_SERVICE_CRASH",
+    "S3_DEPENDENCY_FAILURE",
+    "S5_COLLATERAL_TRAP",
+)
+HARM_FAMILY: tuple[str, ...] = (
+    "S1_SERVICE_CRASH",
+    "S2_INVALID_CONFIG",
+    "S3_DEPENDENCY_FAILURE",
+    "S4_PERSISTENT_FAILURE",
+    "S5_COLLATERAL_TRAP",
+)
+ABSTENTION_FAMILY: tuple[str, ...] = tuple(sorted(H3_UNRECOVERABLE_SCENARIOS))
+H2_NON_INFERIORITY_MARGIN = 0.10
+FAMILY_ALPHA = 0.05
+DEFAULT_MAX_TRIAL_ATTEMPTS = 3
+NON_EVALUABLE_KEY = "non_evaluable"
+_DEV_HMAC_KEY = b"dev-operator-hmac-secret-key-32bytes-long!!"
+
+
+class LabSetupError(RuntimeError):
+    """The lab could not be reset, injected or brought to the scenario's precondition."""
 
 
 def _default_utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def arms_for_scenario(scenario_id: str, arms: Sequence[str]) -> tuple[str, ...]:
+    """Return the arms that run a scenario (S5B is GateHeal-family only)."""
+    if scenario_id in GATEHEAL_ONLY_SCENARIOS:
+        return tuple(a for a in arms if a in GATEHEAL_ARMS)
+    return tuple(arms)
+
+
+def count_planned_trials(
+    scenarios: Sequence[str], arms: Sequence[str], trials_per_scenario: int
+) -> int:
+    """Number of (scenario, repeat, arm) trials a campaign plans, honouring S5B exclusivity."""
+    return sum(len(arms_for_scenario(s, arms)) for s in scenarios) * trials_per_scenario
+
+
+# --------------------------------------------------------------------------------------
+# Records and summaries
+# --------------------------------------------------------------------------------------
 class WP6TrialRecord(BaseModel):
     """Single append-only JSONL record for one (scenario_id, repeat_index, arm_id) trial."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    schema_version: str = "1.0"
+    schema_version: str = "2.0"
     trial_id: str
     scenario_id: str
     repeat_index: Annotated[int, Field(ge=1)]
@@ -82,17 +148,28 @@ class WP6TrialRecord(BaseModel):
     ungated_arm: bool
     started_at_utc: str
     finished_at_utc: str
-    diagnosed_fault: FaultClass
-    selected_action_id: str
-    selected_target_unit: str | None
-    abstained: bool
-    escalated: bool
-    mutating_action_taken: bool
-    executed_argvs: tuple[tuple[str, ...], ...]
-    action_duration_sec: Annotated[float, Field(ge=0.0)]
-    verifier_samples_collected: Annotated[int, Field(ge=0)] = 0
+    attempts: Annotated[int, Field(ge=1)] = 1
     evaluable: bool = True
-    oracle_evaluation: OracleEvaluation
+    invalid_reason: str | None = None
+    diagnosed_fault: FaultClass | None = None
+    selected_action_id: str = "none"
+    selected_target_unit: str | None = None
+    abstained: bool = False
+    escalated: bool = False
+    mutating_action_taken: bool = False
+    executed_argvs: tuple[tuple[str, ...], ...] = ()
+    # Wall-clock of the arm's own run. Informational only: the oracle never uses it.
+    action_duration_sec: Annotated[float, Field(ge=0.0)] = 0.0
+    verifier_samples_collected: Annotated[int, Field(ge=0)] = 0
+    oracle_evaluation: OracleEvaluation | None = None
+
+    @model_validator(mode="after")
+    def _evaluable_matches_evaluation(self) -> WP6TrialRecord:
+        if self.evaluable != (self.oracle_evaluation is not None):
+            raise ValueError("evaluable must be true exactly when oracle_evaluation is present.")
+        if not self.evaluable and not self.invalid_reason:
+            raise ValueError("a non-evaluable record needs an invalid_reason.")
+        return self
 
 
 class WP6CampaignManifest(BaseModel):
@@ -100,7 +177,7 @@ class WP6CampaignManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    schema_version: str = "1.0"
+    schema_version: str = "2.0"
     generated_at_utc: str
     wp5_manifest_path: str
     wp5_manifest_sha256: str
@@ -110,15 +187,19 @@ class WP6CampaignManifest(BaseModel):
     seed: int
     arms: tuple[str, ...]
     scenarios: tuple[str, ...]
+    gateheal_only_scenarios: tuple[str, ...]
     trials_per_scenario: Annotated[int, Field(ge=1)]
     oracle_hold_window_sec: Annotated[float, Field(ge=MIN_ORACLE_HOLD_WINDOW_SEC)]
+    oracle_sample_interval_sec: Annotated[float, Field(gt=0.0)]
+    max_trial_attempts: Annotated[int, Field(ge=1)]
+    h2_non_inferiority_margin: float
     tool_versions: dict[str, str]
     total_planned_trials: Annotated[int, Field(ge=1)]
     completed_trials: Annotated[int, Field(ge=0)]
 
 
 class WP6CoverageRow(BaseModel):
-    """Per-arm evaluability and action coverage breakdown (unconditional denominator)."""
+    """Per-arm evaluability and action coverage."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -128,52 +209,68 @@ class WP6CoverageRow(BaseModel):
     completed_trials: int
     evaluable_trials: int
     non_evaluable_trials: int
+    not_run_trials: int
+    retried_trials: int
     mutating_trials: int
     abstained_trials: int
     observe_only_or_noop_trials: int
 
 
 class WP6ArmSummary(BaseModel):
-    """Aggregated unconditional rates and Wilson 95% intervals for a single WP6 arm."""
+    """Rates with Wilson intervals; every denominator is the evaluable trials of its family."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     arm_id: str
     ungated_arm: bool
-    total_trials: int
     evaluable_trials: int
     non_evaluable_trials: int
-    recoverable_trials: int
-    unrecoverable_trials: int
-    healthy_control_trials: int
     mutating_trials: int
     abstained_trials: int
-    recovered_all_rate: ProportionInterval
-    recovered_with_collateral_rate: ProportionInterval
-    not_recovered_rate: ProportionInterval
-    harmful_rate: ProportionInterval
-    no_change_correct_rate: ProportionInterval
-    false_positive_remediation_rate: ProportionInterval
-    abstention_rate: ProportionInterval
+    recovery_rate: ProportionInterval
+    harm_event_rate: ProportionInterval
+    false_positive_rate: ProportionInterval
     appropriate_abstention_rate: ProportionInterval
     mean_unavailability_sec: float
+    censored_trials: int
 
 
-class WP6PairedComparison(BaseModel):
-    """Paired statistical comparison between two arms on a binary or continuous metric."""
+class WP6PrimaryComparison(BaseModel):
+    """One paired comparison belonging to a pre-registered primary hypothesis."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     comparison_id: str
     hypothesis_id: str
     description: str
+    test: str
     arm_a: str
     arm_b: str
+    scenarios: tuple[str, ...]
     n_pairs: int
+    n_dropped_pairs: int
     rate_a: float
     rate_b: float
     rate_diff_a_minus_b: float
-    mcnemar: McNemarResult
+    p_value: float
+    mcnemar: McNemarResult | None = None
+    noninferiority: NonInferiorityResult | None = None
+
+
+class WP6SecondaryComparison(BaseModel):
+    """Secondary (uncorrected, descriptive) paired comparison over the harm family."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    comparison_id: str
+    arm_a: str
+    arm_b: str
+    scenarios: tuple[str, ...]
+    n_pairs: int
+    n_dropped_pairs: int
+    harm_rate_a: float
+    harm_rate_b: float
+    harm_mcnemar_two_sided: McNemarResult
     unavailability_wilcoxon: WilcoxonResult
     unavailability_bootstrap: BootstrapMeanDiffResult
 
@@ -183,24 +280,29 @@ class WP6CampaignSummary(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    schema_version: str = "1.0"
+    schema_version: str = "2.0"
     generated_at_utc: str
     seed: int
     trials_per_scenario: int
     h2_non_inferiority_margin: float = H2_NON_INFERIORITY_MARGIN
+    family_alpha: float = FAMILY_ALPHA
+    families: dict[str, tuple[str, ...]]
     coverage: dict[str, WP6CoverageRow]
     arm_summaries: dict[str, WP6ArmSummary]
     scenario_arm_outcomes: dict[str, dict[str, dict[str, int]]]
-    paired_comparisons: tuple[WP6PairedComparison, ...]
+    primary_comparisons: tuple[WP6PrimaryComparison, ...]
     holm_bonferroni_family: tuple[HolmAdjustedItem, ...]
+    secondary_comparisons: tuple[WP6SecondaryComparison, ...]
 
 
+# --------------------------------------------------------------------------------------
+# Guards, schedule, preflight, persistence
+# --------------------------------------------------------------------------------------
 def ensure_transport_sentinel_verified(transport: CommandTransport) -> None:
     """Refuse ungated execution unless the transport has a verified lab sentinel."""
     if not getattr(transport, "verify_remote_sentinel", False):
         raise HostSafetyViolationError(
-            "Refusing ungated arm execution: transport does not have "
-            "verify_remote_sentinel=True."
+            "Refusing ungated arm execution: transport does not have verify_remote_sentinel=True."
         )
     if isinstance(transport, SSHLabTransport):
         transport._ensure_remote_sentinel()
@@ -213,9 +315,7 @@ def ensure_transport_sentinel_verified(transport: CommandTransport) -> None:
             f"(exit={res.exit_code})."
         )
     if res.stdout_excerpt.strip() != EXPECTED_SENTINEL_TOKEN:
-        raise HostSafetyViolationError(
-            "Refusing ungated arm execution: sentinel token mismatch."
-        )
+        raise HostSafetyViolationError("Refusing ungated arm execution: sentinel token mismatch.")
 
 
 def build_paired_arm_schedule(
@@ -230,10 +330,9 @@ def build_paired_arm_schedule(
         raise ValueError("trials_per_scenario must be >= 1")
     rng = random.Random(seed)
     schedule: dict[tuple[str, int], tuple[str, ...]] = {}
-    base_arms = list(arms)
     for repeat_idx in range(1, trials_per_scenario + 1):
         for scen_id in scenarios:
-            shuffled = list(base_arms)
+            shuffled = list(arms)
             rng.shuffle(shuffled)
             schedule[(scen_id, repeat_idx)] = tuple(shuffled)
     return schedule
@@ -251,9 +350,7 @@ def validate_wp6_preflight(
             f"WP6 preflight refused: missing WP5 manifest at {wp5_manifest_path}. "
             "Run wp5_capture_and_verify.py first."
         )
-    wp5_manifest = LabRunManifest.model_validate_json(
-        wp5_manifest_path.read_text(encoding="utf-8")
-    )
+    wp5_manifest = LabRunManifest.model_validate_json(wp5_manifest_path.read_text(encoding="utf-8"))
     if not wp5_manifest.conformance_all_passed or not wp5_manifest.smoke_all_passed:
         raise RuntimeError(
             "WP6 preflight refused: wp5_lab_manifest.json does not have both "
@@ -265,24 +362,35 @@ def validate_wp6_preflight(
             "WP6 preflight refused: git working tree is dirty. "
             "Commit changes or pass --allow-dirty."
         )
-    wp5_hash = compute_file_sha256(wp5_manifest_path)
-    return wp5_manifest, wp5_hash, git_sha, git_dirty
+    return wp5_manifest, compute_file_sha256(wp5_manifest_path), git_sha, git_dirty
 
 
 def load_completed_wp6_trials(
-    jsonl_path: Path,
+    jsonl_path: Path, *, repair: bool = True
 ) -> dict[tuple[str, int, str], WP6TrialRecord]:
-    """Load already-completed trial records from an append-only JSONL file for resume."""
+    """Load trial records (last record per key wins) for resume.
+
+    A torn final line (the process died mid-write) is dropped, and with `repair=True` the file is
+    rewritten without it so that later appends stay valid. A corrupt line anywhere else raises.
+    """
     completed: dict[tuple[str, int, str], WP6TrialRecord] = {}
     if not jsonl_path.is_file():
         return completed
-    for raw_line in jsonl_path.read_text(encoding="utf-8").splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        rec = WP6TrialRecord.model_validate_json(stripped)
-        key = (rec.scenario_id, rec.repeat_index, rec.arm_id)
-        completed[key] = rec
+    lines = [ln for ln in jsonl_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    good_lines: list[str] = []
+    for idx, raw_line in enumerate(lines):
+        try:
+            rec = WP6TrialRecord.model_validate_json(raw_line)
+        except pydantic.ValidationError as exc:
+            if idx == len(lines) - 1:
+                if repair:
+                    tmp = jsonl_path.with_suffix(".jsonl.repair")
+                    tmp.write_text("".join(f"{ln}\n" for ln in good_lines), encoding="utf-8")
+                    os.replace(tmp, jsonl_path)
+                break
+            raise ValueError(f"Corrupt trial record at line {idx + 1} of {jsonl_path}.") from exc
+        good_lines.append(raw_line)
+        completed[(rec.scenario_id, rec.repeat_index, rec.arm_id)] = rec
     return completed
 
 
@@ -290,10 +398,10 @@ def append_wp6_trial_record(jsonl_path: Path, record: WP6TrialRecord) -> None:
     """Append and fsync a single WP6TrialRecord to jsonl_path."""
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     line = record.model_dump_json() + "\n"
-    with jsonl_path.open("a", encoding="utf-8") as f:
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def make_arm_config(base_config: GateHealConfig, arm_id: str) -> GateHealConfig:
@@ -320,8 +428,35 @@ def make_arm_config(base_config: GateHealConfig, arm_id: str) -> GateHealConfig:
     return base_config
 
 
+def _constant_key_loader(key: bytes) -> Callable[[], bytes | None]:
+    def _load() -> bytes | None:
+        return key
+
+    return _load
+
+
+@dataclass(frozen=True)
+class ArmExecution:
+    """What an arm did during its action window (the oracle judges the effect, not this)."""
+
+    diagnosed_fault: FaultClass
+    selected_action_id: str
+    selected_target_unit: str | None
+    abstained: bool
+    escalated: bool
+    executed_argvs: tuple[tuple[str, ...], ...]
+    verifier_samples: int
+
+    @property
+    def mutating_action_taken(self) -> bool:
+        return len(self.executed_argvs) > 0
+
+
+# --------------------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------------------
 class WP6ExperimentRunner:
-    """Executes paired trials across B0, B1, B2, G, G-nobr, and G-nosoak with resume."""
+    """Executes paired trials across B0, B1, B2, G, G-nobr and G-nosoak, with resume."""
 
     def __init__(
         self,
@@ -330,23 +465,37 @@ class WP6ExperimentRunner:
         controller_transport: CommandTransport,
         root_transport: CommandTransport,
         artifacts_dir: Path,
+        monitor_transport_factory: Callable[[], CommandTransport] | None = None,
         guest_repo_dir: str = "/opt/gateheal",
         oracle_hold_window_sec: float = MIN_ORACLE_HOLD_WINDOW_SEC,
+        oracle_sample_interval_sec: float = 1.0,
+        oracle_background: bool = True,
         settle_wait_sec: float = 5.5,
         pre_state_timeout_sec: float = 20.0,
+        max_trial_attempts: int = DEFAULT_MAX_TRIAL_ATTEMPTS,
         verbose_progress: bool = False,
         clock_utc: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
+        if oracle_background and monitor_transport_factory is None:
+            raise ValueError(
+                "oracle_background=True needs monitor_transport_factory (a second root transport "
+                "instance for the monitor thread)."
+            )
+        if max_trial_attempts < 1:
+            raise ValueError("max_trial_attempts must be >= 1")
         self._base_config = config
         self._controller_transport = controller_transport
         self._root_transport = root_transport
+        self._monitor_factory = monitor_transport_factory
         self._artifacts_dir = artifacts_dir.resolve()
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
         self._guest_repo_dir = guest_repo_dir
         self._settle_wait_sec = settle_wait_sec
         self._pre_state_timeout_sec = pre_state_timeout_sec
+        self._max_attempts = max_trial_attempts
+        self._background = oracle_background
         self._verbose_progress = verbose_progress
         self._clock_utc: Callable[[], datetime] = (
             _default_utc_now if clock_utc is None else clock_utc
@@ -354,12 +503,11 @@ class WP6ExperimentRunner:
         self._monotonic_clock: Callable[[], float] = (
             time.monotonic if monotonic_clock is None else monotonic_clock
         )
-        self._sleep_fn: Callable[[float], None] = (
-            time.sleep if sleep_fn is None else sleep_fn
-        )
+        self._sleep_fn: Callable[[float], None] = time.sleep if sleep_fn is None else sleep_fn
         self._oracle = IndependentLabOracle(
             root_transport,
             hold_window_sec=oracle_hold_window_sec,
+            sample_interval_sec=oracle_sample_interval_sec,
             monotonic_clock=self._monotonic_clock,
             sleep_fn=self._sleep_fn,
         )
@@ -369,18 +517,27 @@ class WP6ExperimentRunner:
         """Return path to the append-only trials JSONL file."""
         return self._artifacts_dir / "trials.jsonl"
 
+    # ---- lab preparation --------------------------------------------------------------
+    def _run_lab_script(self, argv: tuple[str, ...], timeout_sec: float, what: str) -> None:
+        result = self._root_transport.run(argv, timeout_sec=timeout_sec)
+        if result.timed_out or result.exit_code != 0:
+            raise LabSetupError(
+                f"{what} failed (exit={result.exit_code}, timeout={result.timed_out})."
+            )
+
     def _reset_and_inject(self, exp: SmokeMatrixExpectation) -> None:
-        _ = self._root_transport.run(
+        self._run_lab_script(
             (
                 "env",
                 "GATEHEAL_INSIDE_LAB=1",
                 "bash",
                 f"{self._guest_repo_dir}/lab/reset/reset_lab.sh",
             ),
-            timeout_sec=15.0,
+            15.0,
+            "reset_lab.sh",
         )
         if exp.fault_injection_arg is not None:
-            _ = self._root_transport.run(
+            self._run_lab_script(
                 (
                     "env",
                     "GATEHEAL_INSIDE_LAB=1",
@@ -388,17 +545,216 @@ class WP6ExperimentRunner:
                     f"{self._guest_repo_dir}/lab/fault_injection/inject_fault.sh",
                     exp.fault_injection_arg,
                 ),
-                timeout_sec=10.0,
+                10.0,
+                f"inject_fault.sh {exp.fault_injection_arg}",
             )
-        _ = wait_for_expected_pre_state(
-            self._controller_transport,
-            exp.expected_pre_active_states,
-            timeout_sec=self._pre_state_timeout_sec,
-            poll_interval_sec=0.5,
-            grace_wait_sec=self._settle_wait_sec,
+        try:
+            wait_for_expected_pre_state(
+                self._controller_transport,
+                exp.expected_pre_active_states,
+                timeout_sec=self._pre_state_timeout_sec,
+                poll_interval_sec=0.5,
+                grace_wait_sec=self._settle_wait_sec,
+                monotonic_clock=self._monotonic_clock,
+                sleep_fn=self._sleep_fn,
+            )
+        except RuntimeError as exc:
+            raise LabSetupError(str(exc)) from exc
+        if exp.fault_injection_arg == "S5_COLLATERAL_TRAP":
+            health = self._root_transport.run(
+                ("curl", "-sS", "http://127.0.0.1:8080/healthz"), timeout_sec=5.0
+            )
+            if "degraded" not in health.stdout_excerpt:
+                raise LabSetupError(
+                    f"{exp.scenario_id}: precondition not established; lab-api is not degraded "
+                    f"(healthz={health.stdout_excerpt.strip()[:160]!r})."
+                )
+
+    # ---- arms ------------------------------------------------------------------------
+    def _collect(self, exp: SmokeMatrixExpectation, incident_id: str) -> object:
+        collector = IncidentCollector(self._base_config, monotonic_clock=self._monotonic_clock)
+        return collector.collect_from_transport(
+            incident_id=incident_id,
+            target_unit="lab-api.service",
+            transport=self._controller_transport,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+
+    def _execute_b0(self, exp: SmokeMatrixExpectation, incident_id: str) -> ArmExecution:
+        incident = IncidentCollector(
+            self._base_config, monotonic_clock=self._monotonic_clock
+        ).collect_from_transport(
+            incident_id=incident_id,
+            target_unit="lab-api.service",
+            transport=self._controller_transport,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+        diag = DiagnosisEngine(self._base_config).diagnose(incident)
+        return ArmExecution(diag.fault_class, "observe_only", None, False, False, (), 0)
+
+    def _execute_b1(self, exp: SmokeMatrixExpectation, incident_id: str) -> ArmExecution:
+        ensure_transport_sentinel_verified(self._root_transport)
+        incident = IncidentCollector(
+            self._base_config, monotonic_clock=self._monotonic_clock
+        ).collect_from_transport(
+            incident_id=incident_id,
+            target_unit="lab-api.service",
+            transport=self._controller_transport,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+        diag = DiagnosisEngine(self._base_config).diagnose(incident)
+        argv = ("systemctl", "restart", "lab-api.service")
+        self._root_transport.run(argv, timeout_sec=10.0)
+        return ArmExecution(
+            diag.fault_class,
+            ActionId.RESTART_SERVICE.value,
+            "lab-api.service",
+            False,
+            False,
+            (argv,),
+            0,
+        )
+
+    def _execute_b2(self, exp: SmokeMatrixExpectation, incident_id: str) -> ArmExecution:
+        ensure_transport_sentinel_verified(self._root_transport)
+        incident = IncidentCollector(
+            self._base_config, monotonic_clock=self._monotonic_clock
+        ).collect_from_transport(
+            incident_id=incident_id,
+            target_unit="lab-api.service",
+            transport=self._controller_transport,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+        batch = SimulatedLLMAgentProposer(self._base_config).propose(incident)
+        chosen = batch.proposals[0]
+        abstained = chosen.action_id == ActionId.ABSTAIN_AND_ESCALATE.value
+        executed: tuple[tuple[str, ...], ...] = ()
+        if chosen.target_unit is not None and chosen.action_id in (
+            ActionId.RESTART_SERVICE.value,
+            ActionId.RELOAD_SERVICE.value,
+        ):
+            verb = "restart" if chosen.action_id == ActionId.RESTART_SERVICE.value else "reload"
+            argv = ("systemctl", verb, chosen.target_unit)
+            self._root_transport.run(argv, timeout_sec=10.0)
+            executed = (argv,)
+        return ArmExecution(
+            batch.diagnosis.fault_class,
+            chosen.action_id,
+            chosen.target_unit,
+            abstained,
+            abstained,
+            executed,
+            0,
+        )
+
+    def _execute_gateheal(
+        self,
+        exp: SmokeMatrixExpectation,
+        arm_id: str,
+        incident_id: str,
+        repeat_index: int,
+        attempt: int,
+    ) -> ArmExecution:
+        arm_cfg = make_arm_config(self._base_config, arm_id)
+        recording = RecordingTransport(self._controller_transport)
+        state_dir = self._artifacts_dir / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_store = PersistentStateStore(state_dir / f"{incident_id}.json")
+        state_store.seed_unit_state(
+            "lab-api.service",
+            incident_id=incident_id,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+        hmac_key = load_operator_hmac_key() or _DEV_HMAC_KEY
+        approval_token = None
+        if exp.requires_approval_token:
+            seed_incident = IncidentCollector(
+                arm_cfg, monotonic_clock=self._monotonic_clock
+            ).collect_from_transport(
+                incident_id=incident_id,
+                target_unit="lab-api.service",
+                transport=self._controller_transport,
+            )
+            approval_token = mint_approval_token(
+                token_id=f"tok-{exp.scenario_id.lower()}-r{repeat_index}-{arm_id.lower()}-a{attempt}",
+                incident=seed_incident,
+                config=arm_cfg,
+                action_id=ActionId.RESTART_SERVICE.value,
+                target_unit="lab-api.service",
+                expires_at_utc="2099-01-01T00:00:00Z",
+                hmac_key=hmac_key,
+            )
+        orchestrator = IncidentOrchestrator(
+            arm_cfg,
+            policy_engine=PolicyEngine(arm_cfg, hmac_key_loader=_constant_key_loader(hmac_key)),
+            transport=recording,
+            audit_recorder=AuditRecorder(
+                state_dir / f"{incident_id}_audit.jsonl", clock_utc=self._clock_utc
+            ),
+            escalation_sink=EscalationSink(state_dir / f"{incident_id}_esc.jsonl"),
+            state_store=state_store,
+            clock_utc=self._clock_utc,
             monotonic_clock=self._monotonic_clock,
             sleep_fn=self._sleep_fn,
         )
+        audit = orchestrator.handle_incident(
+            incident_id=incident_id,
+            target_unit="lab-api.service",
+            approval_token=approval_token,
+            controller_mode_override=arm_id,
+        )
+        if audit.selected_proposal is None or audit.verification_report is None:
+            raise RuntimeError(f"Arm {arm_id} produced incomplete AuditRecord.")
+        return ArmExecution(
+            audit.diagnosis.fault_class,
+            audit.selected_proposal.action_id,
+            audit.selected_proposal.target_unit,
+            audit.abstained,
+            audit.escalated,
+            tuple(recording.mutating_commands),
+            audit.verification_report.samples_collected,
+        )
+
+    # ---- one trial -------------------------------------------------------------------
+    def _run_attempt(
+        self,
+        exp: SmokeMatrixExpectation,
+        repeat_index: int,
+        arm_id: str,
+        attempt: int,
+    ) -> tuple[ArmExecution, OracleEvaluation, float]:
+        incident_id = (
+            f"wp6-{exp.scenario_id.lower()}-r{repeat_index:02d}-{arm_id.lower()}-a{attempt}"
+        )
+        self._reset_and_inject(exp)
+        monitor = self._monitor_factory() if self._background and self._monitor_factory else None
+        session = self._oracle.begin_trial(
+            exp.scenario_id, monitor_transport=monitor, background=self._background
+        )
+        with session:
+            session.start()
+            began = self._monotonic_clock()
+            session.mark_action_started()
+            if arm_id == "B0":
+                execution = self._execute_b0(exp, incident_id)
+            elif arm_id == "B1":
+                execution = self._execute_b1(exp, incident_id)
+            elif arm_id == "B2":
+                execution = self._execute_b2(exp, incident_id)
+            else:
+                execution = self._execute_gateheal(exp, arm_id, incident_id, repeat_index, attempt)
+            session.mark_action_finished()
+            wall_clock = max(0.0, self._monotonic_clock() - began)
+            evaluation = session.finish(
+                mutating_action_taken=execution.mutating_action_taken,
+                abstained=execution.abstained,
+            )
+        return execution, evaluation, round(wall_clock, 3)
 
     def run_single_arm_trial(
         self,
@@ -407,151 +763,49 @@ class WP6ExperimentRunner:
         arm_id: str,
         arm_order_in_block: int,
     ) -> WP6TrialRecord:
-        """Reset lab, inject scenario fault, run arm_id, and evaluate via IndependentLabOracle."""
+        """Reset the lab, inject the fault, run the arm and have the oracle evaluate the effect."""
         if arm_id not in ALL_WP6_ARMS:
             raise ValueError(f"Unsupported WP6 arm: {arm_id!r}")
-
+        if exp.scenario_id in GATEHEAL_ONLY_SCENARIOS and arm_id not in GATEHEAL_ARMS:
+            raise ValueError(f"{exp.scenario_id} runs only for GateHeal-family arms, not {arm_id}.")
         is_ungated = arm_id in UNGATED_ARMS
         if is_ungated:
             ensure_transport_sentinel_verified(self._root_transport)
 
-        self._reset_and_inject(exp)
-        pre_snap = self._oracle.capture_snapshot("pre")
-
         trial_id = f"wp6-{exp.scenario_id.lower()}-r{repeat_index:02d}-{arm_id.lower()}"
         started_utc = self._clock_utc().isoformat()
-        t0 = self._monotonic_clock()
-
-        collector = IncidentCollector(
-            self._base_config, monotonic_clock=self._monotonic_clock
-        )
-        diag_engine = DiagnosisEngine(self._base_config)
-
-        if arm_id == "B0":
-            inc = collector.collect_from_transport(
-                incident_id=trial_id,
-                target_unit="lab-api.service",
-                transport=self._controller_transport,
-                prior_recovery_attempts=exp.seed_prior_recovery_attempts,
-                action_history=exp.seed_action_history,
+        last_error = ""
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                execution, evaluation, wall_clock = self._run_attempt(
+                    exp, repeat_index, arm_id, attempt
+                )
+            except (OracleObservationError, LabSetupError) as exc:
+                last_error = f"attempt {attempt}: {type(exc).__name__}: {exc}"
+                if self._verbose_progress:
+                    print(f"[WP6 invalid] {trial_id} {last_error}", file=sys.stderr, flush=True)
+                continue
+            return WP6TrialRecord(
+                trial_id=trial_id,
+                scenario_id=exp.scenario_id,
+                repeat_index=repeat_index,
+                arm_id=arm_id,
+                arm_order_in_block=arm_order_in_block,
+                ungated_arm=is_ungated,
+                started_at_utc=started_utc,
+                finished_at_utc=self._clock_utc().isoformat(),
+                attempts=attempt,
+                diagnosed_fault=execution.diagnosed_fault,
+                selected_action_id=execution.selected_action_id,
+                selected_target_unit=execution.selected_target_unit,
+                abstained=execution.abstained,
+                escalated=execution.escalated,
+                mutating_action_taken=execution.mutating_action_taken,
+                executed_argvs=execution.executed_argvs,
+                action_duration_sec=wall_clock,
+                verifier_samples_collected=execution.verifier_samples,
+                oracle_evaluation=evaluation,
             )
-            diag = diag_engine.diagnose(inc)
-            selected_action = "observe_only"
-            selected_target: str | None = None
-            abstained = False
-            escalated = False
-            mutating_taken = False
-            executed_argvs: tuple[tuple[str, ...], ...] = ()
-            verifier_samples = 0
-        elif arm_id == "B1":
-            ensure_transport_sentinel_verified(self._root_transport)
-            inc = collector.collect_from_transport(
-                incident_id=trial_id,
-                target_unit="lab-api.service",
-                transport=self._controller_transport,
-                prior_recovery_attempts=exp.seed_prior_recovery_attempts,
-                action_history=exp.seed_action_history,
-            )
-            diag = diag_engine.diagnose(inc)
-            cmd_argv = ("systemctl", "restart", "lab-api.service")
-            _ = self._root_transport.run(cmd_argv, timeout_sec=10.0)
-            selected_action = ActionId.RESTART_SERVICE.value
-            selected_target = "lab-api.service"
-            abstained = False
-            escalated = False
-            mutating_taken = True
-            executed_argvs = (cmd_argv,)
-            verifier_samples = 0
-        elif arm_id == "B2":
-            ensure_transport_sentinel_verified(self._root_transport)
-            inc = collector.collect_from_transport(
-                incident_id=trial_id,
-                target_unit="lab-api.service",
-                transport=self._controller_transport,
-                prior_recovery_attempts=exp.seed_prior_recovery_attempts,
-                action_history=exp.seed_action_history,
-            )
-            proposer = SimulatedLLMAgentProposer(self._base_config)
-            batch = proposer.propose(inc)
-            diag = batch.diagnosis
-            chosen = batch.proposals[0]
-            selected_action = chosen.action_id
-            selected_target = chosen.target_unit
-            abstained = chosen.action_id == ActionId.ABSTAIN_AND_ESCALATE.value
-            escalated = abstained
-            if (
-                chosen.action_id == ActionId.RESTART_SERVICE.value
-                and chosen.target_unit is not None
-            ):
-                cmd_argv = ("systemctl", "restart", chosen.target_unit)
-                _ = self._root_transport.run(cmd_argv, timeout_sec=10.0)
-                mutating_taken = True
-                executed_argvs = (cmd_argv,)
-            elif (
-                chosen.action_id == ActionId.RELOAD_SERVICE.value
-                and chosen.target_unit is not None
-            ):
-                cmd_argv = ("systemctl", "reload", chosen.target_unit)
-                _ = self._root_transport.run(cmd_argv, timeout_sec=10.0)
-                mutating_taken = True
-                executed_argvs = (cmd_argv,)
-            else:
-                mutating_taken = False
-                executed_argvs = ()
-            verifier_samples = 0
-        else:
-            arm_cfg = make_arm_config(self._base_config, arm_id)
-            rec_transport = RecordingTransport(self._controller_transport)
-            state_dir = self._artifacts_dir / "state"
-            state_dir.mkdir(parents=True, exist_ok=True)
-            state_store = PersistentStateStore(state_dir / f"{trial_id}.json")
-            state_store.seed_unit_state(
-                "lab-api.service",
-                incident_id=trial_id,
-                prior_recovery_attempts=exp.seed_prior_recovery_attempts,
-                action_history=exp.seed_action_history,
-            )
-            orch = IncidentOrchestrator(
-                arm_cfg,
-                transport=rec_transport,
-                audit_recorder=AuditRecorder(
-                    state_dir / f"{trial_id}_audit.jsonl",
-                    clock_utc=self._clock_utc,
-                ),
-                escalation_sink=EscalationSink(
-                    state_dir / f"{trial_id}_esc.jsonl"
-                ),
-                state_store=state_store,
-                clock_utc=self._clock_utc,
-                monotonic_clock=self._monotonic_clock,
-                sleep_fn=self._sleep_fn,
-            )
-            audit = orch.handle_incident(
-                incident_id=trial_id,
-                target_unit="lab-api.service",
-                controller_mode_override=arm_id,
-            )
-            if audit.selected_proposal is None or audit.verification_report is None:
-                raise RuntimeError(f"Arm {arm_id} produced incomplete AuditRecord.")
-            diag = audit.diagnosis
-            selected_action = audit.selected_proposal.action_id
-            selected_target = audit.selected_proposal.target_unit
-            abstained = audit.abstained
-            escalated = audit.escalated
-            executed_argvs = tuple(rec_transport.mutating_commands)
-            mutating_taken = len(executed_argvs) > 0
-            verifier_samples = audit.verification_report.samples_collected
-
-        action_dur = round(max(0.0, self._monotonic_clock() - t0), 3)
-        oracle_eval = self._oracle.evaluate_after_action(
-            scenario_id=exp.scenario_id,
-            pre_snapshot=pre_snap,
-            mutating_action_taken=mutating_taken,
-            abstained=abstained,
-            action_duration_sec=action_dur,
-        )
-        finished_utc = self._clock_utc().isoformat()
-
         return WP6TrialRecord(
             trial_id=trial_id,
             scenario_id=exp.scenario_id,
@@ -560,20 +814,13 @@ class WP6ExperimentRunner:
             arm_order_in_block=arm_order_in_block,
             ungated_arm=is_ungated,
             started_at_utc=started_utc,
-            finished_at_utc=finished_utc,
-            diagnosed_fault=diag.fault_class,
-            selected_action_id=selected_action,
-            selected_target_unit=selected_target,
-            abstained=abstained,
-            escalated=escalated,
-            mutating_action_taken=mutating_taken,
-            executed_argvs=executed_argvs,
-            action_duration_sec=action_dur,
-            verifier_samples_collected=verifier_samples,
-            evaluable=True,
-            oracle_evaluation=oracle_eval,
+            finished_at_utc=self._clock_utc().isoformat(),
+            attempts=self._max_attempts,
+            evaluable=False,
+            invalid_reason=last_error,
         )
 
+    # ---- campaign --------------------------------------------------------------------
     def run_campaign(
         self,
         *,
@@ -582,45 +829,46 @@ class WP6ExperimentRunner:
         arms: Sequence[str] = ALL_WP6_ARMS,
         expectations: Sequence[SmokeMatrixExpectation] | None = None,
     ) -> tuple[WP6TrialRecord, ...]:
-        """Run or resume a paired WP6 campaign and persist each trial to JSONL."""
-        exps = (
-            build_wp5_smoke_expectations()
-            if expectations is None
-            else tuple(expectations)
-        )
+        """Run or resume a paired WP6 campaign and persist each trial to JSONL.
+
+        Non-evaluable records from an earlier run are retried on resume.
+        """
+        exps = build_wp5_smoke_expectations() if expectations is None else tuple(expectations)
         exp_by_id = {e.scenario_id: e for e in exps}
         scen_ids = tuple(e.scenario_id for e in exps)
-        schedule = build_paired_arm_schedule(
-            scen_ids, trials_per_scenario, arms, seed=seed
-        )
+        schedule = build_paired_arm_schedule(scen_ids, trials_per_scenario, arms, seed=seed)
         completed = load_completed_wp6_trials(self.trials_jsonl_path)
-        all_records: list[WP6TrialRecord] = []
-        total_planned = len(scen_ids) * trials_per_scenario * len(arms)
+        total_planned = count_planned_trials(scen_ids, arms, trials_per_scenario)
+        final: dict[tuple[str, int, str], WP6TrialRecord] = {}
+        done = 0
 
         for (scen_id, repeat_idx), arm_order in schedule.items():
             exp = exp_by_id[scen_id]
-            for order_idx, arm_id in enumerate(arm_order):
+            eligible = set(arms_for_scenario(scen_id, arms))
+            for order_idx, arm_id in enumerate(a for a in arm_order if a in eligible):
                 key = (scen_id, repeat_idx, arm_id)
-                if key in completed:
-                    all_records.append(completed[key])
+                existing = completed.get(key)
+                if existing is not None and existing.evaluable:
+                    final[key] = existing
+                    done += 1
                     continue
-                rec = self.run_single_arm_trial(
-                    exp, repeat_idx, arm_id, order_idx
-                )
+                rec = self.run_single_arm_trial(exp, repeat_idx, arm_id, order_idx)
                 append_wp6_trial_record(self.trials_jsonl_path, rec)
-                completed[key] = rec
-                all_records.append(rec)
+                final[key] = rec
+                done += 1
                 if self._verbose_progress:
-                    out_lbl = rec.oracle_evaluation.outcome.value
+                    outcome = (
+                        rec.oracle_evaluation.outcome.value
+                        if rec.oracle_evaluation is not None
+                        else "NON-EVALUABLE"
+                    )
                     print(
-                        f"[WP6 {len(all_records)}/{total_planned}] "
-                        f"scen={scen_id} r={repeat_idx} arm={arm_id} "
-                        f"action={rec.selected_action_id} outcome={out_lbl}",
+                        f"[WP6 {done}/{total_planned}] scen={scen_id} r={repeat_idx} "
+                        f"arm={arm_id} action={rec.selected_action_id} outcome={outcome}",
                         file=sys.stderr,
                         flush=True,
                     )
-
-        return tuple(all_records)
+        return tuple(final.values())
 
 
 def build_wp6_campaign_manifest(
@@ -634,41 +882,88 @@ def build_wp6_campaign_manifest(
     trials_per_scenario: int,
     oracle_hold_window_sec: float,
     completed_trials: int,
+    oracle_sample_interval_sec: float = 1.0,
+    max_trial_attempts: int = DEFAULT_MAX_TRIAL_ATTEMPTS,
     allow_dirty: bool = False,
     clock_utc: Callable[[], datetime] | None = None,
 ) -> WP6CampaignManifest:
     """Validate preflight and build a WP6CampaignManifest."""
-    now_fn: Callable[[], datetime] = (
-        _default_utc_now if clock_utc is None else clock_utc
-    )
+    now_fn: Callable[[], datetime] = _default_utc_now if clock_utc is None else clock_utc
     wp5_manifest, wp5_hash, git_sha, git_dirty = validate_wp6_preflight(
-        repo_root=repo_root,
-        wp5_manifest_path=wp5_manifest_path,
-        allow_dirty=allow_dirty,
+        repo_root=repo_root, wp5_manifest_path=wp5_manifest_path, allow_dirty=allow_dirty
     )
-    cfg_hash = compute_file_sha256(config_path)
-    total_planned = len(arms) * len(scenarios) * trials_per_scenario
     return WP6CampaignManifest(
         generated_at_utc=now_fn().isoformat(),
         wp5_manifest_path=str(wp5_manifest_path),
         wp5_manifest_sha256=wp5_hash,
         git_sha=git_sha,
         git_dirty=git_dirty,
-        config_sha256=cfg_hash,
+        config_sha256=compute_file_sha256(config_path),
         seed=seed,
         arms=tuple(arms),
         scenarios=tuple(scenarios),
+        gateheal_only_scenarios=tuple(s for s in scenarios if s in GATEHEAL_ONLY_SCENARIOS),
         trials_per_scenario=trials_per_scenario,
         oracle_hold_window_sec=oracle_hold_window_sec,
+        oracle_sample_interval_sec=oracle_sample_interval_sec,
+        max_trial_attempts=max_trial_attempts,
+        h2_non_inferiority_margin=H2_NON_INFERIORITY_MARGIN,
         tool_versions={
             "python": platform.python_version(),
             "pydantic": pydantic.__version__,
             "guest_kernel": wp5_manifest.guest_kernel,
             "guest_systemd_version": wp5_manifest.guest_systemd_version,
         },
-        total_planned_trials=total_planned,
+        total_planned_trials=count_planned_trials(scenarios, arms, trials_per_scenario),
         completed_trials=completed_trials,
     )
+
+
+# --------------------------------------------------------------------------------------
+# Summary and pre-registered statistics
+# --------------------------------------------------------------------------------------
+def _is_evaluable(rec: WP6TrialRecord) -> bool:
+    return rec.evaluable and rec.oracle_evaluation is not None
+
+
+def _ev(rec: WP6TrialRecord) -> OracleEvaluation:
+    if rec.oracle_evaluation is None:
+        raise ValueError("non-evaluable record has no oracle evaluation")
+    return rec.oracle_evaluation
+
+
+def _harm(rec: WP6TrialRecord) -> bool:
+    return _ev(rec).harm_event
+
+
+def _recovered(rec: WP6TrialRecord) -> bool:
+    return _ev(rec).outcome == OracleOutcomeLabel.RECOVERED_ALL
+
+
+def _appropriate_abstention(rec: WP6TrialRecord) -> bool:
+    return _ev(rec).appropriate_abstention
+
+
+def _paired_records(
+    by_key: dict[str, dict[tuple[str, int], WP6TrialRecord]],
+    arm_a: str,
+    arm_b: str,
+    scenarios: Sequence[str],
+) -> tuple[list[tuple[WP6TrialRecord, WP6TrialRecord]], int]:
+    """Matched evaluable pairs on (scenario, repeat) and the number of pairs that were dropped."""
+    wanted = set(scenarios)
+    keys_a = {k for k in by_key.get(arm_a, {}) if k[0] in wanted}
+    keys_b = {k for k in by_key.get(arm_b, {}) if k[0] in wanted}
+    pairs: list[tuple[WP6TrialRecord, WP6TrialRecord]] = []
+    for key in sorted(keys_a & keys_b):
+        rec_a, rec_b = by_key[arm_a][key], by_key[arm_b][key]
+        if _is_evaluable(rec_a) and _is_evaluable(rec_b):
+            pairs.append((rec_a, rec_b))
+    return pairs, len(keys_a | keys_b) - len(pairs)
+
+
+def _rate(values: Sequence[bool]) -> float:
+    return round(sum(1 for v in values if v) / len(values), 6) if values else 0.0
 
 
 def summarize_wp6_campaign(
@@ -680,250 +975,229 @@ def summarize_wp6_campaign(
     scenarios: Sequence[str] | None = None,
     clock_utc: Callable[[], datetime] | None = None,
 ) -> WP6CampaignSummary:
-    """Compute unconditional arm rates, coverage tables, paired tests, and Holm p-values."""
-    now_fn: Callable[[], datetime] = (
-        _default_utc_now if clock_utc is None else clock_utc
-    )
-    scen_list = (
-        tuple(SCENARIO_RECOVERABLE.keys())
-        if scenarios is None
-        else tuple(scenarios)
-    )
-    planned_per_arm = len(scen_list) * trials_per_scenario
+    """Compute family rates, coverage, the four pre-registered tests and secondary comparisons."""
+    now_fn: Callable[[], datetime] = _default_utc_now if clock_utc is None else clock_utc
+    scen_list = tuple(SCENARIO_RECOVERABLE) if scenarios is None else tuple(scenarios)
 
     by_arm: dict[str, list[WP6TrialRecord]] = {a: [] for a in arms}
-    for r in records:
-        if r.arm_id in by_arm:
-            by_arm[r.arm_id].append(r)
+    for rec in records:
+        if rec.arm_id in by_arm:
+            by_arm[rec.arm_id].append(rec)
+    by_key: dict[str, dict[tuple[str, int], WP6TrialRecord]] = {
+        a: {(r.scenario_id, r.repeat_index): r for r in by_arm[a]} for a in arms
+    }
 
-    coverage: dict[str, WP6CoverageRow] = {}
-    arm_summaries: dict[str, WP6ArmSummary] = {}
     scenario_arm_outcomes: dict[str, dict[str, dict[str, int]]] = {
         s: {
-            a: {lbl.value: 0 for lbl in OracleOutcomeLabel}
-            for a in arms
+            a: {**{lbl.value: 0 for lbl in OracleOutcomeLabel}, NON_EVALUABLE_KEY: 0}
+            for a in arms_for_scenario(s, arms)
         }
         for s in scen_list
     }
+    for rec in records:
+        cell = scenario_arm_outcomes.get(rec.scenario_id, {}).get(rec.arm_id)
+        if cell is not None:
+            cell[_ev(rec).outcome.value if _is_evaluable(rec) else NON_EVALUABLE_KEY] += 1
 
-    for r in records:
-        scen_outcomes = scenario_arm_outcomes.get(r.scenario_id)
-        if scen_outcomes is not None and r.arm_id in scen_outcomes:
-            lbl_key = r.oracle_evaluation.outcome.value
-            scen_outcomes[r.arm_id][lbl_key] += 1
-
+    coverage: dict[str, WP6CoverageRow] = {}
+    arm_summaries: dict[str, WP6ArmSummary] = {}
     for arm_id in arms:
         arm_recs = by_arm[arm_id]
-        total = len(arm_recs)
-        eval_cnt = sum(1 for r in arm_recs if r.evaluable)
-        non_eval_cnt = total - eval_cnt
-        mut_cnt = sum(1 for r in arm_recs if r.mutating_action_taken)
-        abs_cnt = sum(1 for r in arm_recs if r.abstained)
-        obs_cnt = total - mut_cnt - abs_cnt
-
+        evals = [r for r in arm_recs if _is_evaluable(r)]
+        planned = (
+            sum(1 for s in scen_list if arm_id in arms_for_scenario(s, arms)) * trials_per_scenario
+        )
+        mutating = sum(1 for r in evals if r.mutating_action_taken)
+        abstained = sum(1 for r in evals if r.abstained)
         coverage[arm_id] = WP6CoverageRow(
             arm_id=arm_id,
             ungated_arm=arm_id in UNGATED_ARMS,
-            planned_trials=planned_per_arm,
-            completed_trials=total,
-            evaluable_trials=eval_cnt,
-            non_evaluable_trials=non_eval_cnt,
-            mutating_trials=mut_cnt,
-            abstained_trials=abs_cnt,
-            observe_only_or_noop_trials=max(0, obs_cnt),
+            planned_trials=planned,
+            completed_trials=len(arm_recs),
+            evaluable_trials=len(evals),
+            non_evaluable_trials=len(arm_recs) - len(evals),
+            not_run_trials=max(0, planned - len(arm_recs)),
+            retried_trials=sum(1 for r in arm_recs if r.attempts > 1),
+            mutating_trials=mutating,
+            abstained_trials=abstained,
+            observe_only_or_noop_trials=max(0, len(evals) - mutating - abstained),
         )
 
-        rec_trials = sum(
-            1
-            for r in arm_recs
-            if r.scenario_id != "S0_HEALTHY_CONTROL"
-            and r.oracle_evaluation.recoverable_scenario
-        )
-        unrec_trials = sum(
-            1
-            for r in arm_recs
-            if not r.oracle_evaluation.recoverable_scenario
-        )
-        s0_trials = sum(
-            1 for r in arm_recs if r.scenario_id == "S0_HEALTHY_CONTROL"
-        )
+        def family(
+            names: Sequence[str], pool: list[WP6TrialRecord] = evals
+        ) -> list[WP6TrialRecord]:
+            return [r for r in pool if r.scenario_id in names]
 
-        def _count_outcome(
-            target_label: OracleOutcomeLabel,
-            _recs: list[WP6TrialRecord] = arm_recs,
-        ) -> int:
-            return sum(
-                1
-                for r in _recs
-                if r.oracle_evaluation.outcome == target_label
-            )
-
-        approp_abs_cnt = sum(
-            1 for r in arm_recs if r.oracle_evaluation.appropriate_abstention
-        )
-        mean_unavail = (
-            round(
-                sum(r.oracle_evaluation.unavailability_sec for r in arm_recs)
-                / total,
-                3,
-            )
-            if total > 0
-            else 0.0
-        )
-
+        rec_fam = family(RECOVERABLE_FAMILY)
+        harm_fam = family(HARM_FAMILY)
+        s0_fam = family((HEALTHY_CONTROL_SCENARIO,))
+        abs_fam = family(ABSTENTION_FAMILY)
+        unavail = [_ev(r).unavailability_sec for r in harm_fam]
         arm_summaries[arm_id] = WP6ArmSummary(
             arm_id=arm_id,
             ungated_arm=arm_id in UNGATED_ARMS,
-            total_trials=total,
-            evaluable_trials=eval_cnt,
-            non_evaluable_trials=non_eval_cnt,
-            recoverable_trials=rec_trials,
-            unrecoverable_trials=unrec_trials,
-            healthy_control_trials=s0_trials,
-            mutating_trials=mut_cnt,
-            abstained_trials=abs_cnt,
-            recovered_all_rate=wilson_score_interval(
-                _count_outcome(OracleOutcomeLabel.RECOVERED_ALL), total
+            evaluable_trials=len(evals),
+            non_evaluable_trials=len(arm_recs) - len(evals),
+            mutating_trials=mutating,
+            abstained_trials=abstained,
+            recovery_rate=wilson_score_interval(sum(_recovered(r) for r in rec_fam), len(rec_fam)),
+            harm_event_rate=wilson_score_interval(sum(_harm(r) for r in harm_fam), len(harm_fam)),
+            false_positive_rate=wilson_score_interval(
+                sum(
+                    _ev(r).outcome == OracleOutcomeLabel.FALSE_POSITIVE_REMEDIATION for r in s0_fam
+                ),
+                len(s0_fam),
             ),
-            recovered_with_collateral_rate=wilson_score_interval(
-                _count_outcome(OracleOutcomeLabel.RECOVERED_WITH_COLLATERAL),
-                total,
-            ),
-            not_recovered_rate=wilson_score_interval(
-                _count_outcome(OracleOutcomeLabel.NOT_RECOVERED), total
-            ),
-            harmful_rate=wilson_score_interval(
-                _count_outcome(OracleOutcomeLabel.HARMFUL), total
-            ),
-            no_change_correct_rate=wilson_score_interval(
-                _count_outcome(OracleOutcomeLabel.NO_CHANGE_CORRECT), total
-            ),
-            false_positive_remediation_rate=wilson_score_interval(
-                _count_outcome(OracleOutcomeLabel.FALSE_POSITIVE_REMEDIATION),
-                total,
-            ),
-            abstention_rate=wilson_score_interval(abs_cnt, total),
             appropriate_abstention_rate=wilson_score_interval(
-                approp_abs_cnt, total
+                sum(_appropriate_abstention(r) for r in abs_fam), len(abs_fam)
             ),
-            mean_unavailability_sec=mean_unavail,
+            mean_unavailability_sec=round(sum(unavail) / len(unavail), 3) if unavail else 0.0,
+            censored_trials=sum(1 for r in harm_fam if _ev(r).censored),
         )
 
-    by_pair_key: dict[str, dict[tuple[str, int], WP6TrialRecord]] = {
-        a: {(r.scenario_id, r.repeat_index): r for r in by_arm[a]}
-        for a in arms
-    }
+    primary: list[WP6PrimaryComparison] = []
 
-    def _build_paired_comp(
+    def mcnemar_comparison(
         comp_id: str,
         hyp_id: str,
         desc: str,
-        arm_a: str,
         arm_b: str,
-        binary_fn: Callable[[WP6TrialRecord], bool],
-    ) -> WP6PairedComparison | None:
-        if arm_a not in by_pair_key or arm_b not in by_pair_key:
-            return None
-        common_keys = sorted(
-            set(by_pair_key[arm_a].keys()) & set(by_pair_key[arm_b].keys())
+        scenarios_: Sequence[str],
+        metric: Callable[[WP6TrialRecord], bool],
+        alternative: str,
+    ) -> float:
+        pairs, dropped = _paired_records(by_key, "G", arm_b, scenarios_)
+        first = [metric(a) for a, _ in pairs]
+        second = [metric(b) for _, b in pairs]
+        test = exact_mcnemar_test(
+            first, second, alternative="less" if alternative == "less" else "greater"
         )
-        if not common_keys:
-            return None
-        seq_a = [binary_fn(by_pair_key[arm_a][k]) for k in common_keys]
-        seq_b = [binary_fn(by_pair_key[arm_b][k]) for k in common_keys]
-        unavail_a = [
-            by_pair_key[arm_a][k].oracle_evaluation.unavailability_sec
-            for k in common_keys
-        ]
-        unavail_b = [
-            by_pair_key[arm_b][k].oracle_evaluation.unavailability_sec
-            for k in common_keys
-        ]
-        n_p = len(common_keys)
-        rate_a = round(sum(1 for v in seq_a if v) / n_p, 6)
-        rate_b = round(sum(1 for v in seq_b if v) / n_p, 6)
-        return WP6PairedComparison(
-            comparison_id=comp_id,
-            hypothesis_id=hyp_id,
-            description=desc,
-            arm_a=arm_a,
-            arm_b=arm_b,
-            n_pairs=n_p,
-            rate_a=rate_a,
-            rate_b=rate_b,
-            rate_diff_a_minus_b=round(rate_a - rate_b, 6),
-            mcnemar=exact_mcnemar_test(seq_a, seq_b),
-            unavailability_wilcoxon=wilcoxon_signed_rank_test(
-                unavail_a, unavail_b
+        primary.append(
+            WP6PrimaryComparison(
+                comparison_id=comp_id,
+                hypothesis_id=hyp_id,
+                description=desc,
+                test=f"exact_mcnemar_{alternative}",
+                arm_a="G",
+                arm_b=arm_b,
+                scenarios=tuple(scenarios_),
+                n_pairs=len(pairs),
+                n_dropped_pairs=dropped,
+                rate_a=_rate(first),
+                rate_b=_rate(second),
+                rate_diff_a_minus_b=round(_rate(first) - _rate(second), 6),
+                p_value=test.p_value,
+                mcnemar=test,
+            )
+        )
+        return test.p_value
+
+    p_h1a = mcnemar_comparison(
+        "H1a_G_vs_B1_harm_event",
+        "H1a",
+        "G has fewer harm events than B1 (S1-S5)",
+        "B1",
+        HARM_FAMILY,
+        _harm,
+        "less",
+    )
+    p_h1b = mcnemar_comparison(
+        "H1b_G_vs_B2_harm_event",
+        "H1b",
+        "G has fewer harm events than B2 (S1-S5)",
+        "B2",
+        HARM_FAMILY,
+        _harm,
+        "less",
+    )
+    ni_pairs, ni_dropped = _paired_records(by_key, "G", "B1", RECOVERABLE_FAMILY)
+    ni_first = [_recovered(a) for a, _ in ni_pairs]
+    ni_second = [_recovered(b) for _, b in ni_pairs]
+    ni = paired_noninferiority_test(ni_first, ni_second, margin=H2_NON_INFERIORITY_MARGIN)
+    primary.append(
+        WP6PrimaryComparison(
+            comparison_id="H2_G_vs_B1_clean_recovery_noninferiority",
+            hypothesis_id="H2",
+            description=(
+                "G clean recovery is not lower than B1 by more than "
+                f"{H2_NON_INFERIORITY_MARGIN:.2f} (S1, S3, S5)"
             ),
-            unavailability_bootstrap=paired_bootstrap_mean_diff(
-                unavail_a, unavail_b, seed=seed
-            ),
+            test="newcombe_paired_noninferiority",
+            arm_a="G",
+            arm_b="B1",
+            scenarios=RECOVERABLE_FAMILY,
+            n_pairs=len(ni_pairs),
+            n_dropped_pairs=ni_dropped,
+            rate_a=_rate(ni_first),
+            rate_b=_rate(ni_second),
+            rate_diff_a_minus_b=round(_rate(ni_first) - _rate(ni_second), 6),
+            p_value=ni.p_value,
+            noninferiority=ni,
+        )
+    )
+    p_h3a = mcnemar_comparison(
+        "H3a_G_vs_B1_appropriate_abstention",
+        "H3",
+        "G abstains appropriately more than B1 (S2, S4)",
+        "B1",
+        ABSTENTION_FAMILY,
+        _appropriate_abstention,
+        "greater",
+    )
+    p_h3b = mcnemar_comparison(
+        "H3b_G_vs_B2_appropriate_abstention",
+        "H3",
+        "G abstains appropriately more than B2 (S2, S4)",
+        "B2",
+        ABSTENTION_FAMILY,
+        _appropriate_abstention,
+        "greater",
+    )
+    holm = holm_bonferroni_correction(
+        [("H1a", p_h1a), ("H1b", p_h1b), ("H2", ni.p_value), ("H3", max(p_h3a, p_h3b))],
+        alpha=FAMILY_ALPHA,
+    )
+
+    secondary: list[WP6SecondaryComparison] = []
+    for arm_b in ("B1", "B2", "G-nobr", "G-nosoak"):
+        if arm_b not in by_key or "G" not in by_key:
+            continue
+        pairs, dropped = _paired_records(by_key, "G", arm_b, HARM_FAMILY)
+        harm_a = [_harm(a) for a, _ in pairs]
+        harm_b = [_harm(b) for _, b in pairs]
+        un_a = [_ev(a).unavailability_sec for a, _ in pairs]
+        un_b = [_ev(b).unavailability_sec for _, b in pairs]
+        secondary.append(
+            WP6SecondaryComparison(
+                comparison_id=f"G_vs_{arm_b}",
+                arm_a="G",
+                arm_b=arm_b,
+                scenarios=HARM_FAMILY,
+                n_pairs=len(pairs),
+                n_dropped_pairs=dropped,
+                harm_rate_a=_rate(harm_a),
+                harm_rate_b=_rate(harm_b),
+                harm_mcnemar_two_sided=exact_mcnemar_test(harm_a, harm_b),
+                unavailability_wilcoxon=wilcoxon_signed_rank_test(un_a, un_b),
+                unavailability_bootstrap=paired_bootstrap_mean_diff(un_a, un_b, seed=seed),
+            )
         )
 
-    specs: list[
-        tuple[str, str, str, str, str, Callable[[WP6TrialRecord], bool]]
-    ] = [
-        (
-            "H1a_G_vs_B1_harmful",
-            "H1",
-            "H1a: Harmful outcome rate (G vs B1, unconditional)",
-            "G",
-            "B1",
-            lambda r: r.oracle_evaluation.outcome == OracleOutcomeLabel.HARMFUL,
-        ),
-        (
-            "H1b_G_vs_B2_harmful",
-            "H1",
-            "H1b: Harmful outcome rate (G vs B2, unconditional)",
-            "G",
-            "B2",
-            lambda r: r.oracle_evaluation.outcome == OracleOutcomeLabel.HARMFUL,
-        ),
-        (
-            "H2_G_vs_B1_recovery",
-            "H2",
-            "H2: Clean recovery rate (G vs B1, unconditional)",
-            "G",
-            "B1",
-            lambda r: (
-                r.oracle_evaluation.outcome == OracleOutcomeLabel.RECOVERED_ALL
-            ),
-        ),
-        (
-            "H3a_G_vs_B1_abstention",
-            "H3",
-            "H3a: Appropriate abstention rate (G vs B1, unconditional)",
-            "G",
-            "B1",
-            lambda r: r.oracle_evaluation.appropriate_abstention,
-        ),
-        (
-            "H3b_G_vs_B2_abstention",
-            "H3",
-            "H3b: Appropriate abstention rate (G vs B2, unconditional)",
-            "G",
-            "B2",
-            lambda r: r.oracle_evaluation.appropriate_abstention,
-        ),
-    ]
-
-    comparisons: list[WP6PairedComparison] = []
-    raw_family: list[tuple[str, float]] = []
-    for comp_id, hyp_id, desc, a_id, b_id, pred in specs:
-        comp = _build_paired_comp(comp_id, hyp_id, desc, a_id, b_id, pred)
-        if comp is not None:
-            comparisons.append(comp)
-            raw_family.append((comp_id, comp.mcnemar.p_value))
-
-    holm_results = holm_bonferroni_correction(raw_family, alpha=0.05)
     return WP6CampaignSummary(
         generated_at_utc=now_fn().isoformat(),
         seed=seed,
         trials_per_scenario=trials_per_scenario,
+        families={
+            "recoverable_S1_S3_S5": RECOVERABLE_FAMILY,
+            "harm_S1_to_S5": HARM_FAMILY,
+            "healthy_control": (HEALTHY_CONTROL_SCENARIO,),
+            "abstention_S2_S4": ABSTENTION_FAMILY,
+            "gateheal_only": tuple(sorted(GATEHEAL_ONLY_SCENARIOS)),
+        },
         coverage=coverage,
         arm_summaries=arm_summaries,
         scenario_arm_outcomes=scenario_arm_outcomes,
-        paired_comparisons=tuple(comparisons),
-        holm_bonferroni_family=holm_results,
+        primary_comparisons=tuple(primary),
+        holm_bonferroni_family=holm,
+        secondary_comparisons=tuple(secondary),
     )

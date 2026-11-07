@@ -16,8 +16,11 @@ from gateheal.reporting import WP6ReportGenerator
 from gateheal.transport import SSHLabTransport, TransportUnavailableError
 from gateheal.wp6_engine import (
     ALL_WP6_ARMS,
+    DEFAULT_MAX_TRIAL_ATTEMPTS,
     WP6ExperimentRunner,
     build_wp6_campaign_manifest,
+    count_planned_trials,
+    load_completed_wp6_trials,
     summarize_wp6_campaign,
     validate_wp6_preflight,
 )
@@ -78,6 +81,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Independent oracle post-action hold window in seconds (>= 15.0).",
     )
     parser.add_argument(
+        "--oracle-sample-interval-sec",
+        type=float,
+        default=1.0,
+        help="Independent oracle monitor sampling interval in seconds (0 < x <= 2.0).",
+    )
+    parser.add_argument(
+        "--max-trial-attempts",
+        type=int,
+        default=DEFAULT_MAX_TRIAL_ATTEMPTS,
+        help="Attempts per trial before it is recorded as non-evaluable.",
+    )
+    parser.add_argument(
         "--settle-wait-sec",
         type=float,
         default=5.5,
@@ -132,6 +147,19 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     cfg = load_config(args.config)
+
+    def make_root_transport() -> SSHLabTransport:
+        # The oracle monitor thread must not share a transport instance with the arm under test.
+        return SSHLabTransport(
+            host=args.ssh_host,
+            port=args.ssh_port,
+            user="root",
+            identity_file=args.harness_identity_file,
+            ssh_multiplex=True,
+            use_remote_timeout=True,
+            verify_remote_sentinel=True,
+        )
+
     controller_transport = SSHLabTransport(
         host=args.ssh_host,
         port=args.ssh_port,
@@ -141,15 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         use_remote_timeout=True,
         verify_remote_sentinel=True,
     )
-    root_transport = SSHLabTransport(
-        host=args.ssh_host,
-        port=args.ssh_port,
-        user="root",
-        identity_file=args.harness_identity_file,
-        ssh_multiplex=True,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
+    root_transport = make_root_transport()
 
     expectations = build_wp5_smoke_expectations()
     scen_ids = tuple(e.scenario_id for e in expectations)
@@ -160,11 +180,43 @@ def main(argv: list[str] | None = None) -> int:
         cfg,
         controller_transport=controller_transport,
         root_transport=root_transport,
+        monitor_transport_factory=make_root_transport,
         artifacts_dir=out_dir,
         guest_repo_dir=args.guest_repo_dir,
         oracle_hold_window_sec=args.hold_window_sec,
+        oracle_sample_interval_sec=args.oracle_sample_interval_sec,
         settle_wait_sec=args.settle_wait_sec,
+        max_trial_attempts=args.max_trial_attempts,
         verbose_progress=True,
+    )
+
+    manifest_path = out_dir / "wp6_manifest.json"
+
+    def write_manifest(completed: int) -> None:
+        manifest = build_wp6_campaign_manifest(
+            repo_root=repo_root,
+            config_path=args.config,
+            wp5_manifest_path=args.wp5_manifest,
+            seed=args.seed,
+            arms=ALL_WP6_ARMS,
+            scenarios=scen_ids,
+            trials_per_scenario=effective_trials,
+            oracle_hold_window_sec=args.hold_window_sec,
+            oracle_sample_interval_sec=args.oracle_sample_interval_sec,
+            max_trial_attempts=args.max_trial_attempts,
+            completed_trials=completed,
+            allow_dirty=bool(args.allow_dirty),
+        )
+        manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    # Written before the first trial so that an interrupted campaign still has its provenance.
+    already_done = len(load_completed_wp6_trials(runner.trials_jsonl_path))
+    write_manifest(already_done)
+    planned = count_planned_trials(scen_ids, ALL_WP6_ARMS, effective_trials)
+    print(
+        f"WP6: {planned} planned trials, {already_done} already on disk (resume re-runs "
+        "non-evaluable ones).",
+        file=sys.stderr,
     )
 
     try:
@@ -184,6 +236,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    except KeyboardInterrupt:
+        print(
+            "Interrupted. Completed trials are already in trials.jsonl; re-run the same command "
+            "to resume.",
+            file=sys.stderr,
+        )
+        return 130
     finally:
         try:
             _ = root_transport.run(
@@ -198,22 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         except TransportUnavailableError:
             pass
 
-    wp6_manifest = build_wp6_campaign_manifest(
-        repo_root=repo_root,
-        config_path=args.config,
-        wp5_manifest_path=args.wp5_manifest,
-        seed=args.seed,
-        arms=ALL_WP6_ARMS,
-        scenarios=scen_ids,
-        trials_per_scenario=effective_trials,
-        oracle_hold_window_sec=args.hold_window_sec,
-        completed_trials=len(records),
-        allow_dirty=bool(args.allow_dirty),
-    )
-    manifest_path = out_dir / "wp6_manifest.json"
-    manifest_path.write_text(
-        wp6_manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
-    )
+    write_manifest(len(records))
 
     summary = summarize_wp6_campaign(
         records,
@@ -225,7 +269,19 @@ def main(argv: list[str] | None = None) -> int:
     reporter = WP6ReportGenerator(summary)
     reporter.write_artifacts(out_dir)
 
-    print(summary.model_dump_json(indent=2))
+    print("\nArm coverage (evaluable / planned):")
+    for arm_id, cov in summary.coverage.items():
+        print(
+            f"  {arm_id:9s} {cov.evaluable_trials}/{cov.planned_trials}  "
+            f"non-evaluable={cov.non_evaluable_trials} not-run={cov.not_run_trials}"
+        )
+    print("\nPre-registered tests (Holm-adjusted):")
+    for item in summary.holm_bonferroni_family:
+        print(
+            f"  {item.hypothesis_id}: raw p={item.raw_p_value:.4g} "
+            f"adjusted p={item.adjusted_p_value:.4g} rejected={item.rejected}"
+        )
+    print(f"\nArtifacts written to {out_dir} (summary.json, report.md, table.tex).")
     return 0
 
 

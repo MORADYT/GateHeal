@@ -9,7 +9,7 @@ import pytest
 
 from gateheal.config import load_config
 from gateheal.lab_bringup import build_wp5_smoke_expectations
-from gateheal.oracle import MIN_ORACLE_HOLD_WINDOW_SEC, OracleOutcomeLabel
+from gateheal.oracle import MIN_ORACLE_HOLD_WINDOW_SEC, OracleEvaluation, OracleOutcomeLabel
 from gateheal.reporting import WP6ReportGenerator
 from gateheal.transport import SSHLabTransport, TransportUnavailableError
 from gateheal.wp6_engine import (
@@ -64,15 +64,19 @@ def test_wp6_live_one_paired_trial_per_arm_on_s1_service_crash(
         use_remote_timeout=True,
         verify_remote_sentinel=True,
     )
-    root_transport = SSHLabTransport(
-        host="127.0.0.1",
-        port=ssh_port,
-        user="root",
-        identity_file=harness_key,
-        ssh_multiplex=True,
-        use_remote_timeout=True,
-        verify_remote_sentinel=True,
-    )
+
+    def make_root_transport() -> SSHLabTransport:
+        return SSHLabTransport(
+            host="127.0.0.1",
+            port=ssh_port,
+            user="root",
+            identity_file=harness_key,
+            ssh_multiplex=True,
+            use_remote_timeout=True,
+            verify_remote_sentinel=True,
+        )
+
+    root_transport = make_root_transport()
 
     s1_exp = [
         e
@@ -85,6 +89,7 @@ def test_wp6_live_one_paired_trial_per_arm_on_s1_service_crash(
         cfg,
         controller_transport=controller_transport,
         root_transport=root_transport,
+        monitor_transport_factory=make_root_transport,
         artifacts_dir=out_dir,
         guest_repo_dir=guest_repo_dir,
         oracle_hold_window_sec=MIN_ORACLE_HOLD_WINDOW_SEC,
@@ -121,19 +126,18 @@ def test_wp6_live_one_paired_trial_per_arm_on_s1_service_crash(
     by_arm = {r.arm_id: r for r in records}
     assert set(by_arm.keys()) == set(ALL_WP6_ARMS)
 
+    def evaluation(arm: str) -> OracleEvaluation:
+        ev = by_arm[arm].oracle_evaluation
+        assert ev is not None, f"{arm} trial was not evaluable: {by_arm[arm].invalid_reason}"
+        return ev
+
     for arm_id, rec in by_arm.items():
         assert rec.ungated_arm is (arm_id in UNGATED_ARMS)
-        assert rec.oracle_evaluation.hold_window_sec >= MIN_ORACLE_HOLD_WINDOW_SEC
+        assert evaluation(arm_id).hold_window_sec >= MIN_ORACLE_HOLD_WINDOW_SEC
 
-    assert (
-        by_arm["B0"].oracle_evaluation.outcome
-        == OracleOutcomeLabel.NOT_RECOVERED
-    )
+    assert evaluation("B0").outcome == OracleOutcomeLabel.NOT_RECOVERED
     for recovering_arm in ("B1", "B2", "G", "G-nobr", "G-nosoak"):
-        assert (
-            by_arm[recovering_arm].oracle_evaluation.outcome
-            == OracleOutcomeLabel.RECOVERED_ALL
-        )
+        assert evaluation(recovering_arm).outcome == OracleOutcomeLabel.RECOVERED_ALL
         assert len(by_arm[recovering_arm].executed_argvs) == 1
 
     summary = summarize_wp6_campaign(

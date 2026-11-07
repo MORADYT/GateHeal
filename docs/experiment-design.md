@@ -115,7 +115,9 @@ Secondary (reported with intervals, not corrected, not used for claims):
   otherwise normal approximation with tie correction), and a seeded percentile bootstrap interval
   of the paired mean difference.
 * Wilson 95 % intervals for every rate.
-* Ablations G vs G-nobr and G vs G-nosoak (McNemar on `harm_event` and on recovery).
+* Paired comparisons G vs B1, B2, G-nobr and G-nosoak over the harm family (S1-S5): exact
+  two-sided McNemar on `harm_event`, with the Wilcoxon and bootstrap results above for
+  unavailability.
 * Per-scenario breakdowns, S5B for the G family, and the false-positive rate on S0.
 
 ## 7. Threats to validity and known limitations

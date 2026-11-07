@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 from gateheal.experiments import CampaignSummaryMetrics
 from gateheal.oracle import OracleOutcomeLabel
-from gateheal.wp6_engine import WP6CampaignSummary
+from gateheal.stats import HolmAdjustedItem, ProportionInterval
+from gateheal.wp6_engine import NON_EVALUABLE_KEY, WP6CampaignSummary
 
 
 class ThesisReportGenerator:
@@ -107,8 +109,53 @@ class ThesisReportGenerator:
                 ])
 
 
+def render_markdown_table(
+    headers: Sequence[str], rows: Sequence[Sequence[str]], *, left_aligned: int = 1
+) -> list[str]:
+    """Render a GitHub-flavoured table whose every row has exactly len(headers) cells."""
+    width = len(headers)
+    if width < 1:
+        raise ValueError("a table needs at least one column")
+    out = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(":---" if i < left_aligned else ":---:" for i in range(width)) + " |",
+    ]
+    for row in rows:
+        if len(row) != width:
+            raise ValueError(f"table row has {len(row)} cells, expected {width}: {row!r}")
+        if any("|" in cell or "\n" in cell for cell in row):
+            raise ValueError(f"table cell contains '|' or a newline: {row!r}")
+        out.append("| " + " | ".join(row) + " |")
+    return out
+
+
+def _pct(ci: ProportionInterval, *, with_ci: bool = True) -> str:
+    """Format a Wilson interval as 'k/n = x% [lo, hi]' (or 'n/a' when the denominator is 0)."""
+    if ci.total == 0:
+        return "n/a (0)"
+    text = f"{ci.successes}/{ci.total} = {ci.proportion * 100:.1f}%"
+    if with_ci:
+        text += f" [{ci.lower * 100:.1f}, {ci.upper * 100:.1f}]"
+    return text
+
+
+def _latex_escape(text: str) -> str:
+    return text.replace("\\", r"\textbackslash{}").replace("_", r"\_").replace("%", r"\%")
+
+
+_OUTCOME_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("Recov. all", OracleOutcomeLabel.RECOVERED_ALL.value),
+    ("Recov. + collateral", OracleOutcomeLabel.RECOVERED_WITH_COLLATERAL.value),
+    ("Not recov.", OracleOutcomeLabel.NOT_RECOVERED.value),
+    ("Harmful", OracleOutcomeLabel.HARMFUL.value),
+    ("No-change correct", OracleOutcomeLabel.NO_CHANGE_CORRECT.value),
+    ("FP remediation", OracleOutcomeLabel.FALSE_POSITIVE_REMEDIATION.value),
+    ("Non-evaluable", NON_EVALUABLE_KEY),
+)
+
+
 class WP6ReportGenerator:
-    """Emits WP6 summary.json, report.md, and LaTeX tables with paired statistics."""
+    """Emits WP6 summary.json, report.md and a LaTeX table from a WP6CampaignSummary."""
 
     def __init__(self, summary: WP6CampaignSummary) -> None:
         self._summary = summary
@@ -118,221 +165,183 @@ class WP6ReportGenerator:
         """Return the underlying WP6CampaignSummary."""
         return self._summary
 
+    def _holm_by_hypothesis(self) -> dict[str, HolmAdjustedItem]:
+        return {h.hypothesis_id: h for h in self._summary.holm_bonferroni_family}
+
     def render_latex_table(self) -> str:
-        """Render WP6 arm summary, scenario breakdown, and Holm p-values in LaTeX."""
-        holm_map = {
-            h.hypothesis_id: h for h in self._summary.holm_bonferroni_family
-        }
+        """Render the arm table and the four pre-registered tests as one LaTeX table."""
+        holm = self._holm_by_hypothesis()
         lines = [
             r"\begin{table*}[htbp]",
             r"  \centering",
-            (
-                r"  \caption{WP6 Paired Live-Lab Evaluation "
-                r"(Unconditional Denominators, 95\% Wilson CIs)}"
-            ),
+            r"  \caption{WP6 paired live-lab evaluation (Wilson 95\% intervals; rates are over "
+            r"evaluable trials of each family)}",
             r"  \label{tab:wp6_paired_results}",
-            r"  \begin{tabular}{lccccccc}",
+            r"  \begin{tabular}{lcccccc}",
             r"    \toprule",
-            r"    \textbf{Arm} & \textbf{Ungated} & \textbf{Trials ($N$)} & "
-            r"\textbf{Recovered All} & \textbf{Collateral} & \textbf{Harmful} & "
-            r"\textbf{Approp. Abstain} & \textbf{Mean Unavail. (s)} \\",
+            r"    \textbf{Arm} & \textbf{Ungated} & \textbf{Evaluable} & "
+            r"\textbf{Clean recovery (S1,S3,S5)} & \textbf{Harm event (S1--S5)} & "
+            r"\textbf{Approp. abstention (S2,S4)} & \textbf{Mean unavail. (s)} \\",
             r"    \midrule",
         ]
         for arm_id, s in self._summary.arm_summaries.items():
-            clean_arm = arm_id.replace("_", r"\_")
-            ung = "Yes" if s.ungated_arm else "No"
-            rec_ci = s.recovered_all_rate
-            col_ci = s.recovered_with_collateral_rate
-            hrm_ci = s.harmful_rate
-            abs_ci = s.appropriate_abstention_rate
             lines.append(
-                f"    {clean_arm} & {ung} & {s.total_trials} & "
-                f"{rec_ci.proportion * 100:.1f}\\% "
-                f"[{rec_ci.lower * 100:.1f}, {rec_ci.upper * 100:.1f}] & "
-                f"{col_ci.proportion * 100:.1f}\\% & "
-                f"{hrm_ci.proportion * 100:.1f}\\% "
-                f"[{hrm_ci.lower * 100:.1f}, {hrm_ci.upper * 100:.1f}] & "
-                f"{abs_ci.proportion * 100:.1f}\\% & "
-                f"{s.mean_unavailability_sec:.2f}s \\\\"
+                f"    {_latex_escape(arm_id)} & {'Yes' if s.ungated_arm else 'No'} & "
+                f"{s.evaluable_trials} & {_latex_escape(_pct(s.recovery_rate))} & "
+                f"{_latex_escape(_pct(s.harm_event_rate))} & "
+                f"{_latex_escape(_pct(s.appropriate_abstention_rate))} & "
+                f"{s.mean_unavailability_sec:.2f} \\\\"
             )
-        lines.extend([
+        lines += [
             r"    \midrule",
-            (
-                r"    \multicolumn{8}{l}{\textbf{Paired Hypothesis Tests "
-                r"(Holm--Bonferroni Adjusted)}} \\"
-            ),
-        ])
-        for comp in self._summary.paired_comparisons:
-            h_item = holm_map.get(comp.comparison_id)
-            adj_p = (
-                h_item.adjusted_p_value
-                if h_item is not None
-                else comp.mcnemar.p_value
-            )
-            clean_id = comp.comparison_id.replace("_", r"\_")
-            b_ci = comp.unavailability_bootstrap
+            r"    \multicolumn{7}{l}{\textbf{Pre-registered tests "
+            r"(Holm--Bonferroni over four hypotheses)}} \\",
+        ]
+        for comp in self._summary.primary_comparisons:
+            item = holm.get(comp.hypothesis_id)
+            adj = f"{item.adjusted_p_value:.4g}" if item is not None else "n/a"
+            decision = "rejected" if item is not None and item.rejected else "not rejected"
             lines.append(
-                f"    \\multicolumn{{8}}{{l}}{{{clean_id}: "
-                f"$\\Delta p = {comp.rate_diff_a_minus_b:+.3f}$, "
-                f"$p_{{\\text{{raw}}}} = {comp.mcnemar.p_value:.4g}$, "
-                f"$p_{{\\text{{Holm}}}} = {adj_p:.4g}$, "
-                f"$\\Delta \\text{{unavail}} = {b_ci.mean_diff:+.2f}$s "
-                f"[{b_ci.ci_lower:+.2f}, {b_ci.ci_upper:+.2f}]}} \\\\"
+                f"    \\multicolumn{{7}}{{l}}{{{_latex_escape(comp.comparison_id)}: "
+                f"$n={comp.n_pairs}$, $\\Delta={comp.rate_diff_a_minus_b:+.3f}$, "
+                f"$p_{{\\mathrm{{raw}}}}={comp.p_value:.4g}$, "
+                f"$p_{{\\mathrm{{Holm}}({_latex_escape(comp.hypothesis_id)})}}={adj}$ "
+                f"({decision})}} \\\\"
             )
-        lines.extend([
-            r"    \bottomrule",
-            r"  \end{tabular}",
-            r"\end{table*}",
-        ])
+        lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
         return "\n".join(lines)
 
     def render_markdown_report(self) -> str:
-        """Render complete WP6 Markdown report with coverage, outcomes, and paired tests."""
-        holm_map = {
-            h.hypothesis_id: h for h in self._summary.holm_bonferroni_family
-        }
+        """Render the full Markdown report; every table is built by render_markdown_table."""
+        s = self._summary
+        holm = self._holm_by_hypothesis()
         lines = [
             "# GateHeal WP6 Live-Lab Paired Experiment Report",
             "",
-            f"- **Generated (UTC):** `{self._summary.generated_at_utc}`",
-            f"- **Randomisation Seed:** `{self._summary.seed}`",
-            f"- **Trials per Scenario per Arm:** `{self._summary.trials_per_scenario}`",
-            f"- **H2 Non-Inferiority Margin:** `{self._summary.h2_non_inferiority_margin:.2f}`",
+            f"- **Generated (UTC):** `{s.generated_at_utc}`",
+            f"- **Randomisation seed:** `{s.seed}`",
+            f"- **Repeats per scenario per arm:** `{s.trials_per_scenario}`",
+            f"- **H2 non-inferiority margin:** `{s.h2_non_inferiority_margin:.2f}`",
+            f"- **Family-wise alpha (Holm-Bonferroni, 4 hypotheses):** `{s.family_alpha}`",
             "",
-            "## 1. Coverage & Evaluability Table (Unconditional Denominators)",
+            "## 1. Families",
             "",
-            (
-                "| Arm | Ungated | Planned | Completed | Evaluable | "
-                "Non-Evaluable | Mutating | Abstained | Observe/No-Op |"
-            ),
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
-        for arm_id, cov in self._summary.coverage.items():
-            lines.append(
-                f"| `{arm_id}` | `{str(cov.ungated_arm).lower()}` | {cov.planned_trials} | "
-                f"{cov.completed_trials} | {cov.evaluable_trials} | "
-                f"{cov.non_evaluable_trials} | {cov.mutating_trials} | "
-                f"{cov.abstained_trials} | {cov.observe_only_or_noop_trials} |"
-            )
+        lines += render_markdown_table(
+            ["Family", "Scenarios"],
+            [[f"`{name}`", ", ".join(f"`{x}`" for x in scen)] for name, scen in s.families.items()],
+        )
 
-        lines.extend([
-            "",
-            "## 2. Arm Summary Rates & 95% Wilson Intervals",
-            "",
-            (
-                "| Arm | Ungated | N | Recovered All [95% CI] | Collateral | "
-                "Harmful [95% CI] | No-Change Correct | FP Remediation | "
-                "Approp. Abstain [95% CI] | Mean Unavail (s) |"
-            ),
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-        ])
-        for arm_id, s in self._summary.arm_summaries.items():
-            r_all = s.recovered_all_rate
-            r_col = s.recovered_with_collateral_rate
-            r_hrm = s.harmful_rate
-            r_ncc = s.no_change_correct_rate
-            r_fpr = s.false_positive_remediation_rate
-            r_abs = s.appropriate_abstention_rate
-            lines.append(
-                f"| `{arm_id}` | `{str(s.ungated_arm).lower()}` | {s.total_trials} | "
-                f"{r_all.proportion * 100:.1f}% "
-                f"[{r_all.lower * 100:.1f}, {r_all.upper * 100:.1f}] | "
-                f"{r_col.proportion * 100:.1f}% | "
-                f"{r_hrm.proportion * 100:.1f}% "
-                f"[{r_hrm.lower * 100:.1f}, {r_hrm.upper * 100:.1f}] | "
-                f"{r_ncc.proportion * 100:.1f}% | "
-                f"{r_fpr.proportion * 100:.1f}% | "
-                f"{r_abs.proportion * 100:.1f}% "
-                f"[{r_abs.lower * 100:.1f}, {r_abs.upper * 100:.1f}] | "
-                f"{s.mean_unavailability_sec:.2f}s |"
-            )
+        lines += ["", "## 2. Coverage and evaluability", ""]
+        lines += render_markdown_table(
+            [
+                "Arm", "Ungated", "Planned", "Completed", "Evaluable", "Non-evaluable",
+                "Not run", "Retried", "Mutating", "Abstained", "Observe/no-op",
+            ],
+            [
+                [
+                    f"`{arm}`", str(c.ungated_arm).lower(), str(c.planned_trials),
+                    str(c.completed_trials), str(c.evaluable_trials),
+                    str(c.non_evaluable_trials), str(c.not_run_trials), str(c.retried_trials),
+                    str(c.mutating_trials), str(c.abstained_trials),
+                    str(c.observe_only_or_noop_trials),
+                ]
+                for arm, c in s.coverage.items()
+            ],
+        )
 
-        lines.extend([
-            "",
-            "## 3. Arm × Scenario Oracle Outcome Counts",
-            "",
-            (
-                "| Scenario | Arm | Recov. All | Collateral | Not Recov. | "
-                "Harmful | No-Change Correct | FP Remediation |"
-            ),
-            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        ])
-        for scen_id, arm_map in self._summary.scenario_arm_outcomes.items():
-            for arm_id, counts in arm_map.items():
-                c_all = counts.get(OracleOutcomeLabel.RECOVERED_ALL.value, 0)
-                c_col = counts.get(
-                    OracleOutcomeLabel.RECOVERED_WITH_COLLATERAL.value, 0
-                )
-                c_not = counts.get(OracleOutcomeLabel.NOT_RECOVERED.value, 0)
-                c_hrm = counts.get(OracleOutcomeLabel.HARMFUL.value, 0)
-                c_ncc = counts.get(
-                    OracleOutcomeLabel.NO_CHANGE_CORRECT.value, 0
-                )
-                c_fpr = counts.get(
-                    OracleOutcomeLabel.FALSE_POSITIVE_REMEDIATION.value, 0
-                )
-                lines.append(
-                    f"| `{scen_id}` | `{arm_id}` | {c_all} | {c_col} | "
-                    f"{c_not} | {c_hrm} | {c_ncc} | {c_fpr} |"
-                )
+        lines += ["", "## 3. Arm rates (Wilson 95% intervals, evaluable trials only)", ""]
+        lines += render_markdown_table(
+            [
+                "Arm", "Ungated", "Clean recovery (S1,S3,S5)", "Harm event (S1-S5)",
+                "False positive (S0)", "Approp. abstention (S2,S4)", "Mean unavail. (s)",
+                "Censored",
+            ],
+            [
+                [
+                    f"`{arm}`", str(a.ungated_arm).lower(), _pct(a.recovery_rate),
+                    _pct(a.harm_event_rate), _pct(a.false_positive_rate, with_ci=False),
+                    _pct(a.appropriate_abstention_rate), f"{a.mean_unavailability_sec:.2f}",
+                    str(a.censored_trials),
+                ]
+                for arm, a in s.arm_summaries.items()
+            ],
+        )
 
-        lines.extend([
-            "",
-            "## 4. Paired Hypothesis Tests & Holm–Bonferroni Adjustment",
-            "",
-            (
-                "| Comparison ID | Hypothesis | Pairs | Rate A | Rate B | "
-                "Diff (A-B) | McNemar p (raw) | Holm p (adj) | Rejected | "
-                "Wilcoxon p | Bootstrap Unavail Diff [95% CI] |"
-            ),
-            (
-                "| :--- | :---: | :---: | :---: | :---: | "
-                "| :---: | :---: | :---: | :---: | :---: | :---: |"
-            ),
-        ])
-        for comp in self._summary.paired_comparisons:
-            h_item = holm_map.get(comp.comparison_id)
-            adj_p = (
-                h_item.adjusted_p_value
-                if h_item is not None
-                else comp.mcnemar.p_value
-            )
-            rej = h_item.rejected if h_item is not None else False
-            boot = comp.unavailability_bootstrap
-            lines.append(
-                f"| `{comp.comparison_id}` | `{comp.hypothesis_id}` | {comp.n_pairs} | "
-                f"{comp.rate_a:.3f} | {comp.rate_b:.3f} | "
-                f"{comp.rate_diff_a_minus_b:+.3f} | "
-                f"{comp.mcnemar.p_value:.4g} | {adj_p:.4g} | `{str(rej).lower()}` | "
-                f"{comp.unavailability_wilcoxon.p_value:.4g} | "
-                f"{boot.mean_diff:+.2f}s [{boot.ci_lower:+.2f}, {boot.ci_upper:+.2f}] |"
-            )
+        lines += ["", "## 4. Scenario x arm oracle outcome counts", ""]
+        rows: list[list[str]] = []
+        for scen, arm_map in s.scenario_arm_outcomes.items():
+            for arm, counts in arm_map.items():
+                cells = [str(counts.get(key, 0)) for _, key in _OUTCOME_COLUMNS]
+                rows.append([f"`{scen}`", f"`{arm}`", *cells])
+        lines += render_markdown_table(
+            ["Scenario", "Arm", *(label for label, _ in _OUTCOME_COLUMNS)], rows, left_aligned=2
+        )
 
-        lines.extend([
+        lines += ["", "## 5. Pre-registered primary tests (Holm-Bonferroni)", ""]
+        lines += render_markdown_table(
+            [
+                "Comparison", "Hypothesis", "Test", "Pairs", "Dropped pairs", "Rate G",
+                "Rate other", "Diff (G - other)", "p (raw)", "p (Holm, hypothesis)", "Rejected",
+            ],
+            [
+                [
+                    f"`{c.comparison_id}`", c.hypothesis_id, f"`{c.test}`", str(c.n_pairs),
+                    str(c.n_dropped_pairs), f"{c.rate_a:.3f}", f"{c.rate_b:.3f}",
+                    f"{c.rate_diff_a_minus_b:+.3f}", f"{c.p_value:.4g}",
+                    f"{holm[c.hypothesis_id].adjusted_p_value:.4g}",
+                    str(holm[c.hypothesis_id].rejected).lower(),
+                ]
+                for c in s.primary_comparisons
+            ],
+        )
+        for c in s.primary_comparisons:
+            if c.noninferiority is not None:
+                ni = c.noninferiority
+                lines += [
+                    "",
+                    f"H2 detail: difference {ni.difference:+.3f}, Newcombe lower bound "
+                    f"{ni.lower_bound:+.3f}, margin -{ni.margin:.2f}, "
+                    f"non-inferior = `{str(ni.non_inferior).lower()}`.",
+                ]
+        lines += [
             "",
-            "## 5. LaTeX Table",
-            "",
-            "```latex",
-            self.render_latex_table(),
-            "```",
-            "",
-        ])
+            "H3 is rejected only if both of its comparisons are significant: its family p-value "
+            "is the larger of the two.",
+        ]
+
+        lines += ["", "## 6. Secondary comparisons (uncorrected, descriptive)", ""]
+        lines += render_markdown_table(
+            [
+                "Comparison", "Pairs", "Dropped pairs", "Harm rate G", "Harm rate other",
+                "McNemar p (two-sided)", "Wilcoxon p (unavail.)", "Wilcoxon method",
+                "Unavail. diff [95% CI] (s)",
+            ],
+            [
+                [
+                    f"`{c.comparison_id}`", str(c.n_pairs), str(c.n_dropped_pairs),
+                    f"{c.harm_rate_a:.3f}", f"{c.harm_rate_b:.3f}",
+                    f"{c.harm_mcnemar_two_sided.p_value:.4g}",
+                    f"{c.unavailability_wilcoxon.p_value:.4g}",
+                    c.unavailability_wilcoxon.method,
+                    f"{c.unavailability_bootstrap.mean_diff:+.2f} "
+                    f"[{c.unavailability_bootstrap.ci_lower:+.2f}, "
+                    f"{c.unavailability_bootstrap.ci_upper:+.2f}]",
+                ]
+                for c in s.secondary_comparisons
+            ],
+        )
+
+        lines += ["", "## 7. LaTeX table", "", "```latex", self.render_latex_table(), "```", ""]
         return "\n".join(lines)
 
     def write_artifacts(self, output_dir: Path) -> tuple[Path, Path, Path]:
-        """Write summary.json, report.md, and table.tex into output_dir."""
+        """Write summary.json, report.md and table.tex into output_dir."""
         output_dir.mkdir(parents=True, exist_ok=True)
         summary_path = output_dir / "summary.json"
         report_md_path = output_dir / "report.md"
         latex_path = output_dir / "table.tex"
-
-        summary_path.write_text(
-            self._summary.model_dump_json(indent=2) + "\n", encoding="utf-8"
-        )
-        report_md_path.write_text(
-            self.render_markdown_report(), encoding="utf-8"
-        )
-        latex_path.write_text(
-            self.render_latex_table() + "\n", encoding="utf-8"
-        )
+        summary_path.write_text(self._summary.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        report_md_path.write_text(self.render_markdown_report(), encoding="utf-8")
+        latex_path.write_text(self.render_latex_table() + "\n", encoding="utf-8")
         return summary_path, report_md_path, latex_path
