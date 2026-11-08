@@ -31,15 +31,19 @@ oracle and by H3.
 |---|---|---|---|
 | S0 | none (healthy control) | n/a | no |
 | S1 | api crashed | yes | no |
-| S2 | invalid config on disk, service still running | **no** | **yes** |
+| S2 | invalid config on disk; lab-api crashes on it a few seconds after injection | **no** | **yes** |
 | S3 | redis down | yes | no |
 | S4 | persistent failure | **no** | **yes** |
 | S5 | stale worker pool (runtime only); reload recovers it, a restart kills the worker | yes (reload) | no |
-| S5B | the **same fault as S5**, with GateHeal history seeded so that the controller escalates to an approved restart | yes (reload) | no |
+| S5B | the **same fault as S5**, with GateHeal history seeded so that the controller escalates to an approved restart (approval token present) | yes (reload) | no |
+| S5U | S5B **without** an approval token | yes (reload) | no |
 
-S5B differs from S5 only in controller state (seeded history and an approval token). For arms B0,
-B1, B2 it is physically identical to S5. It is therefore a **G-family-only scenario**: it is run
-for G, G-nobr and G-nosoak, reported descriptively, and **excluded from the H1-H3 families**.
+S5B and S5U differ from S5 only in controller state (seeded history, with or without an approval
+token). For arms B0, B1, B2 they are physically identical to S5. They are therefore
+**G-family-only scenarios**: they are run for G, G-nobr and G-nosoak, reported descriptively, and
+**excluded from the H1-H3 families**. S5U exists because the approved restart of S5B is allowed
+by G and G-nobr alike; only an *unapproved* restart separates the blast-radius gate from its
+ablation (G escalates, G-nobr restarts and kills the worker).
 
 ## 4. Independent oracle (`gateheal.oracle`)
 
@@ -113,11 +117,13 @@ Secondary (reported with intervals, not corrected, not used for claims):
 
 * Paired Wilcoxon signed-rank on `unavailability_sec` (exact for <= 25 non-zero differences,
   otherwise normal approximation with tie correction), and a seeded percentile bootstrap interval
-  of the paired mean difference.
+  of the paired mean difference. Computed on S1, S3, S5 only (plus S5B and S5U for the ablations):
+  on S2/S4 every arm is censored at the horizon, so they carry no information about the arms.
+  The per-arm mean unavailability in the report uses the same scenarios.
 * Wilson 95 % intervals for every rate.
-* Paired comparisons G vs B1, B2, G-nobr and G-nosoak over the harm family (S1-S5): exact
-  two-sided McNemar on `harm_event`, with the Wilcoxon and bootstrap results above for
-  unavailability.
+* Paired comparisons G vs B1 and B2 over the harm family (S1-S5) and G vs G-nobr and G-nosoak
+  over the harm family plus S5B and S5U: exact two-sided McNemar on `harm_event`, with the
+  Wilcoxon and bootstrap results above for unavailability.
 * Per-scenario breakdowns, S5B for the G family, and the false-positive rate on S0.
 
 ## 7. Threats to validity and known limitations
@@ -126,9 +132,13 @@ Secondary (reported with intervals, not corrected, not used for claims):
 * **Simulated agent.** B2 uses a deterministic simulated proposer until the real LLM arm (WP7).
 * **Oracle resolution.** Sampling is at most every 2 s; sub-interval outages are not seen (the same
   family of limitation as the soak rule D4 in `docs/threat-model.md`).
-* **S2 is latent.** The service keeps running with the old config, so the oracle cannot see the
-  fault before the action; it only sees what an action breaks. H1 captures this; recovery is not
-  defined for S2.
+* **S2 and S4 look alike to the oracle.** In both, lab-api is already failed before the arm acts
+  and no restart or reload can repair it, so every arm is held at the horizon. An arm that restarts
+  there is not scored as harmful (nothing additional fails); the arms differ only in whether they
+  abstain (H3).
+* **Ablations are scenario-limited.** G-nosoak differs from G only in how long the verifier soaks.
+  No scenario has an intermittent fault, so the two are expected to be indistinguishable on every
+  endpoint except the arm's own duration. This is reported as a null result, not a finding.
 * **Observer effect.** The monitor adds about six short SSH commands per sample (about one sample
   per second) on a separate transport. It is identical for every arm, but it is load on the guest
   that a real deployment would not have.
@@ -138,4 +148,16 @@ Secondary (reported with intervals, not corrected, not used for claims):
 
 ## 8. Deviations
 
-None yet.
+None to the hypotheses, endpoints or tests. The first smoke run (`--trials 3`, 2026-11-08) was a
+live run, so the following changes made before the full campaign are recorded here:
+
+* 2026-11-08: S2 was described as "latent"; the smoke data show lab-api has already crashed before
+  the arm acts. The description above was corrected, and the engine now accepts lab-api `active`
+  or `failed` as the S2 pre-state and requires `failed` after the settle wait. (Previously about
+  one S2 attempt in three timed out waiting for `active` and was retried.)
+* 2026-11-08: scenario S5U (S5B without an approval token) was added for G, G-nobr and G-nosoak,
+  because in the smoke run G and G-nobr were indistinguishable on every scenario. It is outside
+  H1-H3.
+* 2026-11-08: unavailability statistics were restricted to scenarios where it can differ between
+  arms (see section 6), and every trial now records why earlier attempts were invalid
+  (`attempt_failures`).

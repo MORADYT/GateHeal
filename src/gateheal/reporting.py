@@ -181,7 +181,7 @@ class WP6ReportGenerator:
             r"    \toprule",
             r"    \textbf{Arm} & \textbf{Ungated} & \textbf{Evaluable} & "
             r"\textbf{Clean recovery (S1,S3,S5)} & \textbf{Harm event (S1--S5)} & "
-            r"\textbf{Approp. abstention (S2,S4)} & \textbf{Mean unavail. (s)} \\",
+            r"\textbf{Approp. abstention (S2,S4)} & \textbf{Mean unavail. S1,S3,S5 (s)} \\",
             r"    \midrule",
         ]
         for arm_id, s in self._summary.arm_summaries.items():
@@ -254,7 +254,8 @@ class WP6ReportGenerator:
         lines += render_markdown_table(
             [
                 "Arm", "Ungated", "Clean recovery (S1,S3,S5)", "Harm event (S1-S5)",
-                "False positive (S0)", "Approp. abstention (S2,S4)", "Mean unavail. (s)",
+                "False positive (S0)", "Approp. abstention (S2,S4)",
+                "Mean unavail. S1,S3,S5 (s)",
                 "Censored",
             ],
             [
@@ -313,15 +314,16 @@ class WP6ReportGenerator:
         lines += ["", "## 6. Secondary comparisons (uncorrected, descriptive)", ""]
         lines += render_markdown_table(
             [
-                "Comparison", "Pairs", "Dropped pairs", "Harm rate G", "Harm rate other",
-                "McNemar p (two-sided)", "Wilcoxon p (unavail.)", "Wilcoxon method",
-                "Unavail. diff [95% CI] (s)",
+                "Comparison", "Harm pairs", "Dropped pairs", "Harm rate G", "Harm rate other",
+                "McNemar p (two-sided)", "Unavail. pairs", "Wilcoxon p (unavail.)",
+                "Wilcoxon method", "Unavail. diff [95% CI] (s)",
             ],
             [
                 [
                     f"`{c.comparison_id}`", str(c.n_pairs), str(c.n_dropped_pairs),
                     f"{c.harm_rate_a:.3f}", f"{c.harm_rate_b:.3f}",
                     f"{c.harm_mcnemar_two_sided.p_value:.4g}",
+                    str(c.n_unavailability_pairs),
                     f"{c.unavailability_wilcoxon.p_value:.4g}",
                     c.unavailability_wilcoxon.method,
                     f"{c.unavailability_bootstrap.mean_diff:+.2f} "

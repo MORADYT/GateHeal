@@ -34,7 +34,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gateheal.agent import SimulatedLLMAgentProposer
-from gateheal.collector import IncidentCollector
+from gateheal.collector import IncidentCollector, parse_systemctl_show
 from gateheal.config import GateHealConfig
 from gateheal.controller import AuditRecorder, EscalationSink
 from gateheal.diagnosis import DiagnosisEngine
@@ -44,7 +44,6 @@ from gateheal.lab_bringup import (
     build_wp5_smoke_expectations,
     compute_file_sha256,
     resolve_git_revision,
-    wait_for_expected_pre_state,
 )
 from gateheal.models import ActionId, FaultClass
 from gateheal.oracle import (
@@ -88,7 +87,10 @@ GATEHEAL_ARMS: frozenset[str] = frozenset({"G", "G-nobr", "G-nosoak"})
 
 # Pre-registered constants (docs/experiment-design.md sections 3 and 6).
 S5B_SCENARIO = "S5B_COLLATERAL_FORCED_RESTART"
-GATEHEAL_ONLY_SCENARIOS: frozenset[str] = frozenset({S5B_SCENARIO})
+# S5U is S5B without an approval token. The approved restart in S5B is allowed by both G and
+# G-nobr, so only an *unapproved* restart separates the blast-radius gate from its ablation.
+S5U_SCENARIO = "S5U_COLLATERAL_UNAPPROVED"
+GATEHEAL_ONLY_SCENARIOS: frozenset[str] = frozenset({S5B_SCENARIO, S5U_SCENARIO})
 RECOVERABLE_FAMILY: tuple[str, ...] = (
     "S1_SERVICE_CRASH",
     "S3_DEPENDENCY_FAILURE",
@@ -102,6 +104,17 @@ HARM_FAMILY: tuple[str, ...] = (
     "S5_COLLATERAL_TRAP",
 )
 ABSTENTION_FAMILY: tuple[str, ...] = tuple(sorted(H3_UNRECOVERABLE_SCENARIOS))
+# Ablations (G vs G-nobr, G vs G-nosoak) also use the GateHeal-family-only scenarios.
+ABLATION_FAMILY: tuple[str, ...] = (*HARM_FAMILY, S5B_SCENARIO, S5U_SCENARIO)
+# Scenarios where an unrecoverable fault holds every arm at the horizon are excluded from the
+# unavailability statistics: they carry no information about the arms.
+UNAVAILABILITY_FAMILY: tuple[str, ...] = RECOVERABLE_FAMILY
+ABLATION_UNAVAILABILITY_FAMILY: tuple[str, ...] = (*RECOVERABLE_FAMILY, S5B_SCENARIO, S5U_SCENARIO)
+# Unit states accepted before the arm acts. In the real lab S2's invalid config makes lab-api
+# crash a few seconds after injection, so "active" or "failed" are both valid on the way there.
+PRE_STATE_ALTERNATIVES: dict[str, dict[str, tuple[str, ...]]] = {
+    "S2_INVALID_CONFIG": {"lab-api.service": ("active", "failed")},
+}
 H2_NON_INFERIORITY_MARGIN = 0.10
 FAMILY_ALPHA = 0.05
 DEFAULT_MAX_TRIAL_ATTEMPTS = 3
@@ -111,6 +124,14 @@ _DEV_HMAC_KEY = b"dev-operator-hmac-secret-key-32bytes-long!!"
 
 class LabSetupError(RuntimeError):
     """The lab could not be reset, injected or brought to the scenario's precondition."""
+
+
+def build_wp6_expectations() -> tuple[SmokeMatrixExpectation, ...]:
+    """WP5 smoke expectations plus the WP6-only S5U scenario (S5B without an approval token)."""
+    base = build_wp5_smoke_expectations()
+    s5b = next(e for e in base if e.scenario_id == S5B_SCENARIO)
+    s5u = s5b.model_copy(update={"scenario_id": S5U_SCENARIO, "requires_approval_token": False})
+    return (*base, s5u)
 
 
 def _default_utc_now() -> datetime:
@@ -151,6 +172,8 @@ class WP6TrialRecord(BaseModel):
     attempts: Annotated[int, Field(ge=1)] = 1
     evaluable: bool = True
     invalid_reason: str | None = None
+    # Why earlier attempts of this trial were invalid (also kept for trials that became valid).
+    attempt_failures: tuple[str, ...] = ()
     diagnosed_fault: FaultClass | None = None
     selected_action_id: str = "none"
     selected_target_unit: str | None = None
@@ -258,7 +281,7 @@ class WP6PrimaryComparison(BaseModel):
 
 
 class WP6SecondaryComparison(BaseModel):
-    """Secondary (uncorrected, descriptive) paired comparison over the harm family."""
+    """Secondary (uncorrected, descriptive) paired comparison."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -266,8 +289,10 @@ class WP6SecondaryComparison(BaseModel):
     arm_a: str
     arm_b: str
     scenarios: tuple[str, ...]
+    unavailability_scenarios: tuple[str, ...]
     n_pairs: int
     n_dropped_pairs: int
+    n_unavailability_pairs: int
     harm_rate_a: float
     harm_rate_b: float
     harm_mcnemar_two_sided: McNemarResult
@@ -525,6 +550,33 @@ class WP6ExperimentRunner:
                 f"{what} failed (exit={result.exit_code}, timeout={result.timed_out})."
             )
 
+    def _wait_for_pre_state(self, exp: SmokeMatrixExpectation) -> None:
+        """Poll until every unit is in an accepted pre-state, then wait the settle grace."""
+        accepted: dict[str, tuple[str, ...]] = {
+            unit: (state,) for unit, state in exp.expected_pre_active_states.items()
+        }
+        accepted.update(PRE_STATE_ALTERNATIVES.get(exp.scenario_id, {}))
+        start = self._monotonic_clock()
+        last_observed: dict[str, str] = {}
+        while True:
+            for unit in accepted:
+                res = self._controller_transport.run(
+                    ("systemctl", "show", unit, "--property=ActiveState,SubState"),
+                    timeout_sec=5.0,
+                )
+                props = parse_systemctl_show(res.stdout_excerpt)
+                last_observed[unit] = props.get("ActiveState", "unknown").strip()
+            if all(last_observed[u] in states for u, states in accepted.items()):
+                if self._settle_wait_sec > 0.0:
+                    self._sleep_fn(self._settle_wait_sec)
+                return
+            if self._monotonic_clock() - start >= self._pre_state_timeout_sec:
+                raise LabSetupError(
+                    f"Timed out after {self._pre_state_timeout_sec}s waiting for pre-states "
+                    f"{accepted}; last_observed={last_observed}"
+                )
+            self._sleep_fn(0.5)
+
     def _reset_and_inject(self, exp: SmokeMatrixExpectation) -> None:
         self._run_lab_script(
             (
@@ -548,18 +600,17 @@ class WP6ExperimentRunner:
                 10.0,
                 f"inject_fault.sh {exp.fault_injection_arg}",
             )
-        try:
-            wait_for_expected_pre_state(
-                self._controller_transport,
-                exp.expected_pre_active_states,
-                timeout_sec=self._pre_state_timeout_sec,
-                poll_interval_sec=0.5,
-                grace_wait_sec=self._settle_wait_sec,
-                monotonic_clock=self._monotonic_clock,
-                sleep_fn=self._sleep_fn,
+        self._wait_for_pre_state(exp)
+        if exp.scenario_id == "S2_INVALID_CONFIG":
+            api = self._controller_transport.run(
+                ("systemctl", "show", "lab-api.service", "--property=ActiveState"),
+                timeout_sec=5.0,
             )
-        except RuntimeError as exc:
-            raise LabSetupError(str(exc)) from exc
+            if "ActiveState=failed" not in api.stdout_excerpt:
+                raise LabSetupError(
+                    f"{exp.scenario_id}: precondition not established; lab-api is not failed "
+                    f"({api.stdout_excerpt.strip()[:160]!r})."
+                )
         if exp.fault_injection_arg == "S5_COLLATERAL_TRAP":
             health = self._root_transport.run(
                 ("curl", "-sS", "http://127.0.0.1:8080/healthz"), timeout_sec=5.0
@@ -775,6 +826,7 @@ class WP6ExperimentRunner:
         trial_id = f"wp6-{exp.scenario_id.lower()}-r{repeat_index:02d}-{arm_id.lower()}"
         started_utc = self._clock_utc().isoformat()
         last_error = ""
+        failures: list[str] = []
         for attempt in range(1, self._max_attempts + 1):
             try:
                 execution, evaluation, wall_clock = self._run_attempt(
@@ -782,6 +834,7 @@ class WP6ExperimentRunner:
                 )
             except (OracleObservationError, LabSetupError) as exc:
                 last_error = f"attempt {attempt}: {type(exc).__name__}: {exc}"
+                failures.append(last_error[:400])
                 if self._verbose_progress:
                     print(f"[WP6 invalid] {trial_id} {last_error}", file=sys.stderr, flush=True)
                 continue
@@ -795,6 +848,7 @@ class WP6ExperimentRunner:
                 started_at_utc=started_utc,
                 finished_at_utc=self._clock_utc().isoformat(),
                 attempts=attempt,
+                attempt_failures=tuple(failures),
                 diagnosed_fault=execution.diagnosed_fault,
                 selected_action_id=execution.selected_action_id,
                 selected_target_unit=execution.selected_target_unit,
@@ -818,6 +872,7 @@ class WP6ExperimentRunner:
             attempts=self._max_attempts,
             evaluable=False,
             invalid_reason=last_error,
+            attempt_failures=tuple(failures),
         )
 
     # ---- campaign --------------------------------------------------------------------
@@ -833,7 +888,7 @@ class WP6ExperimentRunner:
 
         Non-evaluable records from an earlier run are retried on resume.
         """
-        exps = build_wp5_smoke_expectations() if expectations is None else tuple(expectations)
+        exps = build_wp6_expectations() if expectations is None else tuple(expectations)
         exp_by_id = {e.scenario_id: e for e in exps}
         scen_ids = tuple(e.scenario_id for e in exps)
         schedule = build_paired_arm_schedule(scen_ids, trials_per_scenario, arms, seed=seed)
@@ -1032,7 +1087,7 @@ def summarize_wp6_campaign(
         harm_fam = family(HARM_FAMILY)
         s0_fam = family((HEALTHY_CONTROL_SCENARIO,))
         abs_fam = family(ABSTENTION_FAMILY)
-        unavail = [_ev(r).unavailability_sec for r in harm_fam]
+        unavail = [_ev(r).unavailability_sec for r in family(UNAVAILABILITY_FAMILY)]
         arm_summaries[arm_id] = WP6ArmSummary(
             arm_id=arm_id,
             ungated_arm=arm_id in UNGATED_ARMS,
@@ -1162,19 +1217,25 @@ def summarize_wp6_campaign(
     for arm_b in ("B1", "B2", "G-nobr", "G-nosoak"):
         if arm_b not in by_key or "G" not in by_key:
             continue
-        pairs, dropped = _paired_records(by_key, "G", arm_b, HARM_FAMILY)
+        ablation = arm_b in ("G-nobr", "G-nosoak")
+        harm_scen = ABLATION_FAMILY if ablation else HARM_FAMILY
+        un_scen = ABLATION_UNAVAILABILITY_FAMILY if ablation else UNAVAILABILITY_FAMILY
+        pairs, dropped = _paired_records(by_key, "G", arm_b, harm_scen)
+        un_pairs, _ = _paired_records(by_key, "G", arm_b, un_scen)
         harm_a = [_harm(a) for a, _ in pairs]
         harm_b = [_harm(b) for _, b in pairs]
-        un_a = [_ev(a).unavailability_sec for a, _ in pairs]
-        un_b = [_ev(b).unavailability_sec for _, b in pairs]
+        un_a = [_ev(a).unavailability_sec for a, _ in un_pairs]
+        un_b = [_ev(b).unavailability_sec for _, b in un_pairs]
         secondary.append(
             WP6SecondaryComparison(
                 comparison_id=f"G_vs_{arm_b}",
                 arm_a="G",
                 arm_b=arm_b,
-                scenarios=HARM_FAMILY,
+                scenarios=harm_scen,
+                unavailability_scenarios=un_scen,
                 n_pairs=len(pairs),
                 n_dropped_pairs=dropped,
+                n_unavailability_pairs=len(un_pairs),
                 harm_rate_a=_rate(harm_a),
                 harm_rate_b=_rate(harm_b),
                 harm_mcnemar_two_sided=exact_mcnemar_test(harm_a, harm_b),
@@ -1193,6 +1254,8 @@ def summarize_wp6_campaign(
             "healthy_control": (HEALTHY_CONTROL_SCENARIO,),
             "abstention_S2_S4": ABSTENTION_FAMILY,
             "gateheal_only": tuple(sorted(GATEHEAL_ONLY_SCENARIOS)),
+            "ablation_harm": ABLATION_FAMILY,
+            "unavailability_S1_S3_S5": UNAVAILABILITY_FAMILY,
         },
         coverage=coverage,
         arm_summaries=arm_summaries,

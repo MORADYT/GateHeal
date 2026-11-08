@@ -10,7 +10,6 @@ from pathlib import Path
 
 from gateheal.config import load_config
 from gateheal.controller import default_artifacts_dir
-from gateheal.lab_bringup import build_wp5_smoke_expectations
 from gateheal.oracle import MIN_ORACLE_HOLD_WINDOW_SEC
 from gateheal.reporting import WP6ReportGenerator
 from gateheal.transport import SSHLabTransport, TransportUnavailableError
@@ -19,6 +18,7 @@ from gateheal.wp6_engine import (
     DEFAULT_MAX_TRIAL_ATTEMPTS,
     WP6ExperimentRunner,
     build_wp6_campaign_manifest,
+    build_wp6_expectations,
     count_planned_trials,
     load_completed_wp6_trials,
     summarize_wp6_campaign,
@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     root_transport = make_root_transport()
 
-    expectations = build_wp5_smoke_expectations()
+    expectations = build_wp6_expectations()
     scen_ids = tuple(e.scenario_id for e in expectations)
     out_dir: Path = args.output_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

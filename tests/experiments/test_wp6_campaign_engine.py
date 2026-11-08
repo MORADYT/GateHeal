@@ -22,7 +22,6 @@ from gateheal.lab_bringup import (
     SmokeScenarioRunResult,
     SSHLatencyProfile,
     build_lab_run_manifest,
-    build_wp5_smoke_expectations,
 )
 from gateheal.models import VerificationStatus
 from gateheal.oracle import OracleOutcomeLabel
@@ -34,18 +33,23 @@ from gateheal.transport import (
     TransportResult,
 )
 from gateheal.wp6_engine import (
+    ABLATION_FAMILY,
     ALL_WP6_ARMS,
     GATEHEAL_ARMS,
     GATEHEAL_ONLY_SCENARIOS,
     H2_NON_INFERIORITY_MARGIN,
+    HARM_FAMILY,
     NON_EVALUABLE_KEY,
     S5B_SCENARIO,
+    S5U_SCENARIO,
+    UNAVAILABILITY_FAMILY,
     WP6ExperimentRunner,
     WP6TrialRecord,
     append_wp6_trial_record,
     arms_for_scenario,
     build_paired_arm_schedule,
     build_wp6_campaign_manifest,
+    build_wp6_expectations,
     count_planned_trials,
     ensure_transport_sentinel_verified,
     load_completed_wp6_trials,
@@ -75,6 +79,8 @@ class _SimulatedLiveGuestHarness:
         self.worker_active = "active"
         self.config_valid = True
         self.worker_pool_stale = False
+        # In the real lab S2's invalid config crashes lab-api a few seconds after injection.
+        self.s2_api_crashes = True
         self.api_inv = "inv-api-1"
         self.api_start_usec = 10_000_000
         self._inv_counter = 1
@@ -96,6 +102,8 @@ class _SimulatedLiveGuestHarness:
             self.api_active = "failed"
         elif scen == "S2_INVALID_CONFIG":
             self.config_valid = False
+            if self.s2_api_crashes:
+                self.api_active = "failed"
         elif scen == "S3_DEPENDENCY_FAILURE":
             self.redis_active = "failed"
         elif scen == "S4_PERSISTENT_FAILURE":
@@ -267,7 +275,7 @@ def _make_runner(
 
 
 def _exp(scenario_id: str) -> SmokeMatrixExpectation:
-    return next(e for e in build_wp5_smoke_expectations() if e.scenario_id == scenario_id)
+    return next(e for e in build_wp6_expectations() if e.scenario_id == scenario_id)
 
 
 def _by(records: Sequence[WP6TrialRecord]) -> dict[tuple[str, str], WP6TrialRecord]:
@@ -283,14 +291,14 @@ def full_campaign(tmp_path_factory: pytest.TempPathFactory) -> tuple[WP6TrialRec
 
 def test_wp6_paired_schedule_is_deterministic_and_seed_sensitive() -> None:
     """Pairing and randomisation are deterministic for a seed and vary across seeds."""
-    scenarios = tuple(e.scenario_id for e in build_wp5_smoke_expectations())
+    scenarios = tuple(e.scenario_id for e in build_wp6_expectations())
     sched_1 = build_paired_arm_schedule(scenarios, 3, seed=20261028)
     sched_2 = build_paired_arm_schedule(scenarios, 3, seed=20261028)
     sched_diff = build_paired_arm_schedule(scenarios, 3, seed=999999)
 
     assert sched_1 == sched_2
     assert sched_1 != sched_diff
-    assert len(sched_1) == 7 * 3
+    assert len(sched_1) == 8 * 3
     for arm_order in sched_1.values():
         assert set(arm_order) == set(ALL_WP6_ARMS)
         assert len(arm_order) == len(ALL_WP6_ARMS)
@@ -298,13 +306,14 @@ def test_wp6_paired_schedule_is_deterministic_and_seed_sensitive() -> None:
 
 def test_wp6_s5b_is_gateheal_family_only() -> None:
     """S5B differs from S5 only in controller state, so baselines never run it."""
-    assert GATEHEAL_ONLY_SCENARIOS == {S5B_SCENARIO}
-    assert arms_for_scenario(S5B_SCENARIO, ALL_WP6_ARMS) == tuple(
-        a for a in ALL_WP6_ARMS if a in GATEHEAL_ARMS
-    )
+    assert GATEHEAL_ONLY_SCENARIOS == {S5B_SCENARIO, S5U_SCENARIO}
+    for g_only in (S5B_SCENARIO, S5U_SCENARIO):
+        assert arms_for_scenario(g_only, ALL_WP6_ARMS) == tuple(
+            a for a in ALL_WP6_ARMS if a in GATEHEAL_ARMS
+        )
     assert arms_for_scenario("S1_SERVICE_CRASH", ALL_WP6_ARMS) == ALL_WP6_ARMS
-    scenarios = tuple(e.scenario_id for e in build_wp5_smoke_expectations())
-    assert count_planned_trials(scenarios, ALL_WP6_ARMS, 20) == (6 * 6 + 3) * 20
+    scenarios = tuple(e.scenario_id for e in build_wp6_expectations())
+    assert count_planned_trials(scenarios, ALL_WP6_ARMS, 20) == (6 * 6 + 2 * 3) * 20
 
 
 def test_wp6_ungated_arms_refuse_transport_without_verified_sentinel(tmp_path: Path) -> None:
@@ -370,13 +379,15 @@ def test_wp6_engine_never_uses_the_removed_oracle_shortcut() -> None:
 
 
 def test_wp6_trial_counts_and_pairing(full_campaign: tuple[WP6TrialRecord, ...]) -> None:
-    """39 trials per repeat (6 scenarios x 6 arms + S5B x 3 G arms), all evaluable."""
-    assert len(full_campaign) == 2 * 39
+    """42 trials per repeat (6 scenarios x 6 arms + S5B and S5U x 3 G arms), all evaluable."""
+    assert len(full_campaign) == 2 * 42
     assert all(r.evaluable and r.oracle_evaluation is not None for r in full_campaign)
-    s5b_arms = {r.arm_id for r in full_campaign if r.scenario_id == S5B_SCENARIO}
-    assert s5b_arms == GATEHEAL_ARMS
+    for g_only in (S5B_SCENARIO, S5U_SCENARIO):
+        assert {r.arm_id for r in full_campaign if r.scenario_id == g_only} == GATEHEAL_ARMS
     for rep in (1, 2):
-        for scen in {r.scenario_id for r in full_campaign if r.scenario_id != S5B_SCENARIO}:
+        for scen in {
+            r.scenario_id for r in full_campaign if r.scenario_id not in GATEHEAL_ONLY_SCENARIOS
+        }:
             arms = {
                 r.arm_id
                 for r in full_campaign
@@ -434,6 +445,8 @@ def test_wp6_observation_failure_is_retried_then_valid(tmp_path: Path) -> None:
     assert root.oracle_probe_failures_injected == 1
     assert rec.evaluable
     assert rec.attempts == 2
+    assert len(rec.attempt_failures) == 1
+    assert "OracleObservationError" in rec.attempt_failures[0]
     assert rec.oracle_evaluation is not None
     assert rec.oracle_evaluation.outcome == OracleOutcomeLabel.RECOVERED_ALL
 
@@ -595,7 +608,8 @@ def test_wp6_summary_uses_preregistered_families_and_holm_of_four(
         "S2_INVALID_CONFIG",
         "S4_PERSISTENT_FAILURE",
     }
-    assert S5B_SCENARIO not in {s for c in comps.values() for s in c.scenarios}
+    in_primary = {s for c in comps.values() for s in c.scenarios}
+    assert not in_primary & GATEHEAL_ONLY_SCENARIOS
     assert "S0_HEALTHY_CONTROL" not in {s for c in comps.values() for s in c.scenarios}
 
     ni = comps["H2_G_vs_B1_clean_recovery_noninferiority"].noninferiority
@@ -632,8 +646,9 @@ def test_wp6_summary_denominators_and_coverage(full_campaign: tuple[WP6TrialReco
         assert cov.non_evaluable_trials == 0 and cov.not_run_trials == 0
         assert cov.evaluable_trials == cov.planned_trials
     assert summary.coverage["B1"].planned_trials == 6 * 2
-    assert summary.coverage["G"].planned_trials == 7 * 2
-    assert set(summary.scenario_arm_outcomes[S5B_SCENARIO]) == GATEHEAL_ARMS
+    assert summary.coverage["G"].planned_trials == 8 * 2
+    for g_only in (S5B_SCENARIO, S5U_SCENARIO):
+        assert set(summary.scenario_arm_outcomes[g_only]) == GATEHEAL_ARMS
 
     g, b1, b2 = (summary.arm_summaries[x] for x in ("G", "B1", "B2"))
     assert g.harm_event_rate.successes == 0
@@ -711,7 +726,7 @@ def test_wp6_markdown_report_is_well_formed(
     assert tex.count(r"\begin{tabular}") == tex.count(r"\end{tabular}") == 1
     # Row-level arithmetic: scenario table has exactly one row per (scenario, eligible arm).
     rows = re.findall(r"^\| `S\w+` \| `[\w-]+` \|", md, flags=re.MULTILINE)
-    assert len(rows) == 6 * 6 + 3
+    assert len(rows) == 6 * 6 + 2 * 3
 
 
 def test_wp6_render_markdown_table_rejects_bad_rows() -> None:
@@ -758,7 +773,7 @@ def test_wp6_manifest_and_provenance(
     )
     wp5_path = tmp_path / "wp5.json"
     wp5_path.write_text(valid_wp5.model_dump_json(indent=2), encoding="utf-8")
-    scen = tuple(e.scenario_id for e in build_wp5_smoke_expectations())
+    scen = tuple(e.scenario_id for e in build_wp6_expectations())
     man = build_wp6_campaign_manifest(
         repo_root=_repo_root(),
         config_path=_repo_root() / "configs" / "phase1_lab.yaml",
@@ -772,9 +787,9 @@ def test_wp6_manifest_and_provenance(
         allow_dirty=True,
         clock_utc=lambda: NOW,
     )
-    assert man.completed_trials == 78
-    assert man.total_planned_trials == 78
-    assert man.gateheal_only_scenarios == (S5B_SCENARIO,)
+    assert man.completed_trials == 84
+    assert man.total_planned_trials == 84
+    assert man.gateheal_only_scenarios == (S5B_SCENARIO, S5U_SCENARIO)
     assert man.h2_non_inferiority_margin == pytest.approx(0.10)
     assert len(man.wp5_manifest_sha256) == 64
 
@@ -846,3 +861,80 @@ def test_wp6_report_shows_holm_adjusted_p_not_raw(
         assert cells[10] == str(item.rejected).lower()
         differs += int(cells[8] != cells[9])
     assert differs >= 1
+
+
+def test_wp6_s5u_separates_the_blast_radius_gate_from_its_ablation(
+    full_campaign: tuple[WP6TrialRecord, ...],
+) -> None:
+    """Without an approval token G escalates, but G-nobr restarts and kills the worker."""
+    t = _by(full_campaign)
+
+    def ev(arm: str):  # type: ignore[no-untyped-def]
+        e = t[(S5U_SCENARIO, arm)].oracle_evaluation
+        assert e is not None
+        return e
+
+    assert t[(S5U_SCENARIO, "G")].abstained and not t[(S5U_SCENARIO, "G")].mutating_action_taken
+    assert not ev("G").harm_event
+    # The fault is recoverable, so escalating is safe but neither recovery nor appropriate.
+    assert ev("G").outcome == OracleOutcomeLabel.NOT_RECOVERED
+    assert not ev("G").appropriate_abstention
+    assert t[(S5U_SCENARIO, "G-nosoak")].abstained
+    assert t[(S5U_SCENARIO, "G-nobr")].mutating_action_taken
+    assert ev("G-nobr").harm_event
+    assert ev("G-nobr").outcome == OracleOutcomeLabel.RECOVERED_WITH_COLLATERAL
+
+    summary = summarize_wp6_campaign(full_campaign, trials_per_scenario=2, clock_utc=lambda: NOW)
+    sec = {c.comparison_id: c for c in summary.secondary_comparisons}
+    nobr = sec["G_vs_G-nobr"]
+    assert set(nobr.scenarios) == set(ABLATION_FAMILY)
+    assert nobr.n_pairs == 7 * 2
+    assert nobr.harm_rate_b > nobr.harm_rate_a
+    assert nobr.harm_mcnemar_two_sided.p_value == pytest.approx(0.5)  # 2 discordant pairs
+    assert sec["G_vs_B1"].scenarios == HARM_FAMILY
+    assert not set(sec["G_vs_B1"].scenarios) & GATEHEAL_ONLY_SCENARIOS
+
+
+def test_wp6_unavailability_statistics_exclude_unrecoverable_scenarios(
+    full_campaign: tuple[WP6TrialRecord, ...],
+) -> None:
+    """S2/S4 hold every arm at the horizon, so they must not dominate the arm means."""
+    summary = summarize_wp6_campaign(full_campaign, trials_per_scenario=2, clock_utc=lambda: NOW)
+    assert summary.arm_summaries["B0"].mean_unavailability_sec == pytest.approx(60.0)
+    assert summary.arm_summaries["G"].mean_unavailability_sec < 5.0
+    sec = {c.comparison_id: c for c in summary.secondary_comparisons}
+    assert set(sec["G_vs_B1"].unavailability_scenarios) == set(UNAVAILABILITY_FAMILY)
+    assert sec["G_vs_B1"].n_unavailability_pairs == 3 * 2
+    assert sec["G_vs_G-nobr"].n_unavailability_pairs == 5 * 2
+
+
+def test_wp6_s2_precondition_is_the_crashed_api(tmp_path: Path) -> None:
+    """S2 is valid only once lab-api has crashed on the invalid config (as in the real lab)."""
+    ok_runner, _ = _make_runner(tmp_path, name="s2_ok")
+    ok = ok_runner.run_single_arm_trial(_exp("S2_INVALID_CONFIG"), 1, "B0", 0)
+    assert ok.evaluable
+    assert ok.oracle_evaluation is not None
+    assert ok.oracle_evaluation.pre_snapshot.failing_units == ("lab-api.service",)
+
+    guest = _SimulatedLiveGuestHarness()
+    guest.s2_api_crashes = False  # the fault did not take effect
+    bad_runner, _ = _make_runner(tmp_path, guest=guest, max_trial_attempts=1, name="s2_bad")
+    bad = bad_runner.run_single_arm_trial(_exp("S2_INVALID_CONFIG"), 1, "B0", 0)
+    assert not bad.evaluable
+    assert bad.invalid_reason and "lab-api is not failed" in bad.invalid_reason
+
+
+def test_wp6_pre_state_wait_times_out_with_a_setup_error(tmp_path: Path) -> None:
+    """A scenario whose units never reach the expected states is invalid, not an outcome."""
+    guest = _SimulatedLiveGuestHarness()
+    original_inject = guest.inject
+
+    def stuck(scen: str) -> None:
+        original_inject(scen)
+        guest.redis_active = "failed"  # S1 expects redis active
+
+    guest.inject = stuck  # type: ignore[method-assign]
+    runner, _ = _make_runner(tmp_path, guest=guest, max_trial_attempts=1)
+    rec = runner.run_single_arm_trial(_exp("S1_SERVICE_CRASH"), 1, "B0", 0)
+    assert not rec.evaluable
+    assert rec.invalid_reason and "Timed out" in rec.invalid_reason

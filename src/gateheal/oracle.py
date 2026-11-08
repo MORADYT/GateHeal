@@ -51,8 +51,8 @@ LAB_UNITS: tuple[str, ...] = (
 
 # Physical recoverability of the injected fault by an allowed remediation (restart/reload).
 # S5B injects the same fault as S5 (a reload recovers it); it only differs in the seeded
-# controller history, so it is physically recoverable. S2 (invalid config on disk) and S4
-# (persistent failure) cannot be repaired by restart or reload.
+# controller history, so it is physically recoverable; S5U is S5B without an approval token.
+# S2 (invalid config on disk) and S4 (persistent failure) cannot be repaired by restart or reload.
 SCENARIO_RECOVERABLE: dict[str, bool] = {
     "S0_HEALTHY_CONTROL": True,
     "S1_SERVICE_CRASH": True,
@@ -61,6 +61,7 @@ SCENARIO_RECOVERABLE: dict[str, bool] = {
     "S4_PERSISTENT_FAILURE": False,
     "S5_COLLATERAL_TRAP": True,
     "S5B_COLLATERAL_FORCED_RESTART": True,
+    "S5U_COLLATERAL_UNAPPROVED": True,
 }
 
 # Scenarios that form the H3 (appropriate abstention) family.
