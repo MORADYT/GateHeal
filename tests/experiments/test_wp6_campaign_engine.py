@@ -938,3 +938,36 @@ def test_wp6_pre_state_wait_times_out_with_a_setup_error(tmp_path: Path) -> None
     rec = runner.run_single_arm_trial(_exp("S1_SERVICE_CRASH"), 1, "B0", 0)
     assert not rec.evaluable
     assert rec.invalid_reason and "Timed out" in rec.invalid_reason
+
+
+def test_wp6_resummarize_script_rebuilds_the_report_from_trials(
+    full_campaign: tuple[WP6TrialRecord, ...], tmp_path: Path
+) -> None:
+    """The offline script reproduces the in-process summary from trials.jsonl alone."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "wp6_resummarize", _repo_root() / "lab" / "scripts" / "wp6_resummarize.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    jsonl = tmp_path / "trials.jsonl"
+    for rec in full_campaign:
+        append_wp6_trial_record(jsonl, rec)
+    out = tmp_path / "rebuilt"
+    assert module.main(["--trials-jsonl", str(jsonl), "--output-dir", str(out)]) == 0
+
+    expected = summarize_wp6_campaign(full_campaign, trials_per_scenario=2)
+    rebuilt = (out / "summary.json").read_text(encoding="utf-8")
+    assert expected.primary_comparisons[0].comparison_id in rebuilt
+    import json
+
+    data = json.loads(rebuilt)
+    assert data["trials_per_scenario"] == 2
+    ids = [h["hypothesis_id"] for h in data["holm_bonferroni_family"]]
+    assert ids == ["H1a", "H1b", "H2", "H3"]
+    assert (out / "report.md").is_file() and (out / "table.tex").is_file()
+    missing = ["--trials-jsonl", str(tmp_path / "none.jsonl"), "--output-dir", str(out)]
+    assert module.main(missing) == 2

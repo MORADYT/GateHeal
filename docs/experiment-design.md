@@ -161,3 +161,15 @@ live run, so the following changes made before the full campaign are recorded he
 * 2026-11-08: unavailability statistics were restricted to scenarios where it can differ between
   arms (see section 6), and every trial now records why earlier attempts were invalid
   (`attempt_failures`).
+* 2026-11-10 (after the full campaign, no change to any hypothesis, endpoint or test): p-values
+  were stored rounded to 12 decimals and the H2 non-inferiority p-value had a floor of 1e-12, which
+  turned the full-campaign p-values (about 1e-12 and below) into rounding artefacts and put H2
+  in the wrong place in the Holm ordering. p-values are now kept to 12 significant figures and the
+  H2 p-value is found on a log scale down to 1e-300. The report is regenerated from the unchanged
+  `trials.jsonl` with `lab/scripts/wp6_resummarize.py`; all conclusions are the same.
+* 2026-11-10: the host computer was suspended during the full campaign, so wall-clock time is
+  43 h but trial time is about 5.3 h. Two suspensions fell between trials (19 h and 3 h) and one
+  fell inside two consecutive trials (S5B repeat 16, arms G-nobr and G-nosoak, 13.5 h and 1.4 h of
+  wall-clock). The oracle uses a monotonic clock that does not advance during suspension; the
+  outcome, harm flag and unavailability of those two trials are identical to their 19 peers, and
+  they belong to the G-family-only ablation set, not to H1-H3.

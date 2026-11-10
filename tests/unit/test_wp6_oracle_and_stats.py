@@ -934,3 +934,36 @@ def test_bootstrap_is_deterministic_and_matches_regression_values() -> None:
         stats.paired_bootstrap_mean_diff([1.0], [])
     with pytest.raises(ValueError):
         stats.paired_bootstrap_mean_diff([1.0], [1.0], n_resamples=0)
+
+
+def test_tiny_p_values_are_not_rounded_to_a_floor() -> None:
+    """With 40 discordant pairs p = 2**-40; neither it nor the Holm values may collapse to 1e-12."""
+    mc = stats.exact_mcnemar_test([False] * 40, [True] * 40, alternative="less")
+    assert mc.p_value == pytest.approx(2.0**-40, rel=1e-9)
+    assert mc.p_value < 1e-12
+
+    first = [True] * 60
+    second = [True] * 20 + [False] * 40
+    ni = stats.paired_noninferiority_test(first, second, margin=0.10)
+    assert ni.non_inferior
+    assert 0.0 < ni.p_value < 1e-15  # far below the old 1e-12 floor
+
+    holm = stats.holm_bonferroni_correction(
+        [("a", 2.0**-40), ("b", 2.0**-40), ("c", ni.p_value), ("d", 2.0**-40)]
+    )
+    by_id = {h.hypothesis_id: h for h in holm}
+    assert by_id["c"].raw_p_value == pytest.approx(ni.p_value, rel=1e-9)
+    assert by_id["c"].adjusted_p_value == pytest.approx(4 * ni.p_value, rel=1e-9)
+    # c is the smallest, so the others are multiplied by 3 (not 4) and kept monotone.
+    for key in ("a", "b", "d"):
+        assert by_id[key].raw_p_value == pytest.approx(2.0**-40, rel=1e-9)
+        assert by_id[key].adjusted_p_value == pytest.approx(3 * 2.0**-40, rel=1e-9)
+        assert by_id[key].rejected
+
+
+def test_noninferiority_p_is_still_one_when_the_estimate_is_inside_the_margin() -> None:
+    first = [True] * 5 + [False] * 15
+    second = [True] * 15 + [False] * 5
+    ni = stats.paired_noninferiority_test(first, second, margin=0.10)
+    assert ni.p_value == 1.0
+    assert not ni.non_inferior

@@ -131,6 +131,11 @@ def _z_for_confidence(confidence: float) -> float:
     return statistics.NormalDist().inv_cdf(1.0 - 0.5 * (1.0 - confidence))
 
 
+def _sig(value: float, digits: int = 12) -> float:
+    """Round to `digits` significant figures (p-values below 1e-12 must not collapse to 0)."""
+    return float(f"{value:.{digits}g}")
+
+
 def _check_confidence(confidence: float) -> None:
     if not (0.0 < confidence < 1.0):
         raise ValueError(f"confidence must be in (0, 1), got {confidence}")
@@ -189,7 +194,7 @@ def exact_mcnemar_test(
         b_only_first_true=b_count,
         c_only_second_true=c_count,
         discordant_total=n_disc,
-        p_value=round(p_val, 12) if p_val > 1e-12 else p_val,
+        p_value=_sig(p_val),
     )
 
 
@@ -292,7 +297,7 @@ def wilcoxon_signed_rank_test(
         w_minus=round(w_minus, 6),
         statistic=round(w_stat, 6),
         z_score=round(z_val, 8),
-        p_value=round(p_val, 12),
+        p_value=_sig(p_val),
         method=method,
     )
 
@@ -360,7 +365,7 @@ def _paired_counts(first: Sequence[bool], second: Sequence[bool]) -> tuple[int, 
 
 
 def _newcombe_paired_bounds(
-    a: int, b: int, c: int, d: int, confidence: float
+    a: int, b: int, c: int, d: int, confidence: float, *, z: float | None = None
 ) -> tuple[float, float, float, float, float]:
     """Return (p_first, p_second, difference, lower, upper) by Newcombe (1998) method 10.
 
@@ -369,7 +374,7 @@ def _newcombe_paired_bounds(
     n = a + b + c + d
     p1 = (a + b) / n
     p2 = (a + c) / n
-    z = _z_for_confidence(confidence)
+    z = _z_for_confidence(confidence) if z is None else z
     l1, u1 = _wilson_bounds(a + b, n, z)
     l2, u2 = _wilson_bounds(a + c, n, z)
 
@@ -461,21 +466,23 @@ def paired_noninferiority_test(
         )
 
     def lower_at(one_sided_alpha: float) -> float:
-        return _newcombe_paired_bounds(a, b, c, d, 1.0 - 2.0 * one_sided_alpha)[3]
+        # z from the upper-tail probability directly: 1 - 2*alpha loses all precision below 1e-16.
+        z_alpha = -statistics.NormalDist().inv_cdf(one_sided_alpha)
+        return _newcombe_paired_bounds(a, b, c, d, 1.0 - 2.0 * one_sided_alpha, z=z_alpha)[3]
 
     _, _, diff, lower, _ = _newcombe_paired_bounds(a, b, c, d, 1.0 - 2.0 * alpha)
     threshold = -margin
     if diff <= threshold:
         p_val = 1.0
     else:
-        lo, hi = 1e-12, 0.5 - 1e-12
+        lo, hi = 1e-300, 0.5 - 1e-12
         if lower_at(lo) > threshold:
             p_val = lo
         elif lower_at(hi) <= threshold:
             p_val = 1.0
         else:
-            for _ in range(80):
-                mid = 0.5 * (lo + hi)
+            for _ in range(200):
+                mid = math.sqrt(lo * hi)  # bisect on the log scale: p can be astronomically small
                 if lower_at(mid) > threshold:
                     hi = mid
                 else:
@@ -488,7 +495,7 @@ def paired_noninferiority_test(
         difference=round(diff, 6),
         lower_bound=round(lower, 6),
         non_inferior=lower > threshold,
-        p_value=round(min(1.0, max(0.0, p_val)), 12),
+        p_value=_sig(min(1.0, max(0.0, p_val))),
     )
 
 
@@ -601,8 +608,8 @@ def holm_bonferroni_correction(
         rejected = (not step_down_stopped) and (adj_p <= alpha)
         adjusted_by_idx[orig_idx] = HolmAdjustedItem(
             hypothesis_id=hyp_id,
-            raw_p_value=round(raw_p, 12),
-            adjusted_p_value=round(adj_p, 12),
+            raw_p_value=_sig(raw_p),
+            adjusted_p_value=_sig(adj_p),
             rejected=rejected,
             alpha=alpha,
         )
