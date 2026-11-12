@@ -174,6 +174,10 @@ live run, so the following changes made before the full campaign are recorded he
   outcome, harm flag and unavailability of those two trials are identical to their 19 peers, and
   they belong to the G-family-only ablation set, not to H1-H3.
 * 2026-11-12: section 9 (WP7 LLM family) was added before any live LLM run. It does not alter H1-H3, the oracle or the baseline arms.
+* 2026-11-12 (WP7 smoke run, before any WP7 data was analysed): `max_tokens` 400 truncated 31 of 42
+  answers of the reasoning model, which were then scored as abstentions. The default is now 4000,
+  a truncated answer is an invalid attempt, and the smoke output was discarded. No hypothesis,
+  endpoint or test changed.
 
 ## 9. LLM family (WP7, registered before the first live LLM run)
 
@@ -193,9 +197,11 @@ are stored in `wp6_manifest.json`). Only the gate differs.
   capability, verification, soak and the audit chain are the ones used by `G`. S5B and S5U run for
   `G-LLM` only, like the other GateHeal-family arms.
 
-**Model settings.** `deepseek-chat`, temperature 0, JSON mode, `max_tokens` 400, at most 3 requests
+**Model settings.** the model named in `wp6_manifest.json` (see Deviations: the provider's reasoning model
+`deepseek-flash` reached through the gateway `api.mayanext.com`), temperature 0, JSON mode,
+`max_tokens` 4000, at most 3 requests
 per trial (a trial's first call is the only one B2-LLM makes; G-LLM may make more if the model
-proposes a diagnostic action first), 60 s HTTP timeout, at most 3 HTTP tries per request, and a
+proposes a diagnostic action first), 120 s HTTP timeout, at most 3 HTTP tries per request, and a
 campaign-wide cap on live requests. The API key is read from an environment variable and is never
 written to any record, cassette or manifest. Every request and raw response is appended to a
 cassette (`llm_cassette.jsonl`).
@@ -205,7 +211,9 @@ after retries, or a replay miss) is not model behaviour: the attempt is invalid 
 oracle observation failure, and a trial that never gets an answer is stored non-evaluable. It is
 never scored as an abstention. Authentication or billing errors (HTTP 401/402/403) and the request
 cap stop the whole campaign. A response that is not valid JSON, has a wrong schema or proposes an
-unknown action *is* model behaviour; the proposer turns it into a safe abstention.
+unknown action *is* model behaviour; the proposer turns it into a safe abstention. A response cut
+off by the token limit (`finish_reason` `length`) is *not* model behaviour: it is a harness limit, so the
+attempt is invalid and retried, and a trial that is always truncated shows up as non-evaluable.
 
 **Hypotheses (one-sided, alpha 0.05, Holm over exactly these three).**
 
@@ -235,5 +243,9 @@ and the same repeat count as the baseline campaign. `lab/scripts/wp6_resummarize
   result, not an error.
 * A stronger prompt or a different model may behave differently; the conclusions are for this
   prompt, this model name and this lab.
+* The model is a reasoning model and the provider is a gateway, so the model behind the name
+  cannot be verified; the thesis describes it as the model served under that ID on that date. Its
+  hidden reasoning consumes `max_tokens` and adds seconds of latency (smoke run: mean 9.9 s,
+  maximum 33 s per call).
 * Incident records (unit states and log excerpts from the lab VM) are sent to a third-party API.
   They contain no personal data.

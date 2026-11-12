@@ -13,6 +13,8 @@ from gateheal.controller import default_artifacts_dir
 from gateheal.llm import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_ENDPOINT_URL,
+    DEFAULT_HTTP_TIMEOUT_SEC,
+    DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_NAME,
     LLMBackend,
     LLMBudgetExceeded,
@@ -154,11 +156,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1500,
         help="Hard cap on live HTTP requests (retries included) for this process.",
     )
-    parser.add_argument("--llm-max-tokens", type=int, default=400)
+    parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Completion budget. Reasoning models spend part of it thinking; a response cut off "
+        "at this limit is an invalid attempt, never an abstention.",
+    )
     parser.add_argument(
         "--llm-http-timeout-sec",
         type=float,
-        default=60.0,
+        default=DEFAULT_HTTP_TIMEOUT_SEC,
         help="Per-request HTTP timeout. LLM latency counts toward measured unavailability.",
     )
     parser.add_argument(

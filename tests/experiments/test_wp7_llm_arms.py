@@ -342,6 +342,40 @@ def test_transport_failure_is_non_evaluable_never_an_abstention(tmp_path: Path) 
     assert model.keys_seen  # the key was attached to requests
 
 
+def test_truncated_answers_are_invalid_not_abstentions_and_retry_can_succeed(
+    tmp_path: Path,
+) -> None:
+    truncated = json.dumps(
+        {
+            "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 3000, "completion_tokens": 400},
+        }
+    )
+    state = {"n": 0}
+
+    class _Raw(_ScriptedModel):
+        def __call__(self, request: object, timeout: float) -> _Resp:
+            state["n"] += 1
+            if state["n"] <= 2:
+                return _Resp(truncated)
+            return super().__call__(request, timeout)
+
+    runner, *_ = _make_llm_runner(tmp_path, _naive_restart, name="o_ok")
+    runner._llm.sender._urlopen = _Raw(_naive_restart)  # type: ignore[union-attr]  # noqa: SLF001
+    for arm in ("B2-LLM", "G-LLM"):
+        state["n"] = 0
+        rec = _trial(runner, "S1_SERVICE_CRASH", arm)
+        assert rec.evaluable and rec.attempts == 3  # two truncated attempts, then a real answer
+        assert not rec.abstained and rec.mutating_action_taken
+        assert any("truncated" in f for f in rec.attempt_failures)
+
+    always = _make_llm_runner(tmp_path, _naive_restart, name="o_bad", max_trial_attempts=2)[0]
+    always._llm.sender._urlopen = lambda _r, timeout: _Resp(truncated)  # type: ignore[union-attr]  # noqa: SLF001
+    rec = _trial(always, "S1_SERVICE_CRASH", "B2-LLM")
+    assert rec.evaluable is False and rec.abstained is False
+    assert rec.invalid_reason is not None and "truncated" in rec.invalid_reason
+
+
 def test_transient_503_is_absorbed_and_the_trial_is_valid(tmp_path: Path) -> None:
     state = {"n": 0}
 
@@ -396,7 +430,7 @@ def test_both_arms_send_the_identical_system_prompt_and_settings(tmp_path: Path)
     for body in (*b2_bodies, *g_bodies):
         assert body["messages"][0]["content"] == expected  # type: ignore[index]
         assert body["temperature"] == 0.0
-        assert body["max_tokens"] == 400
+        assert body["max_tokens"] == 4000
         assert body["model"] == "deepseek-chat"
         assert body["response_format"] == {"type": "json_object"}
 

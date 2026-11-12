@@ -40,6 +40,10 @@ DEFAULT_ENDPOINT_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL_NAME = "deepseek-chat"
 DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
 LLM_MAX_REQUESTS_PER_TRIAL = 3
+# Reasoning models spend part of max_tokens on hidden reasoning before the JSON answer. The WP7
+# smoke run showed 400 tokens truncated 74% of answers, so the default leaves ample headroom.
+DEFAULT_MAX_TOKENS = 4000
+DEFAULT_HTTP_TIMEOUT_SEC = 120.0
 RETRYABLE_HTTP_CODES: frozenset[int] = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 FATAL_HTTP_CODES: frozenset[int] = frozenset({401, 402, 403})
 LLMMode = Literal["live", "record", "replay"]
@@ -72,8 +76,9 @@ class LLMCallRecord(BaseModel):
     latency_sec: Annotated[float, Field(ge=0.0)] = 0.0
     http_attempts: Annotated[int, Field(ge=0)] = 0
     replayed: bool = False
-    # None on success; "transport" and "replay_miss" make the trial attempt invalid.
-    error_kind: Literal["transport", "replay_miss"] | None = None
+    # None on success; every other value makes the trial attempt invalid. "truncated" means the
+    # provider stopped at max_tokens (finish_reason "length"): a harness limit, not model behaviour.
+    error_kind: Literal["transport", "replay_miss", "truncated"] | None = None
     error: str | None = None
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
     completion_tokens: Annotated[int, Field(ge=0)] = 0
@@ -180,6 +185,9 @@ class LLMCassette:
             self._entries[request_sha] = response
 
 
+_TRUNCATED_MSG = "response truncated at max_tokens (finish_reason=length); raise --llm-max-tokens"
+
+
 def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "[REDACTED]") if secret else text
 
@@ -209,7 +217,7 @@ class ResilientLLMSender:
         api_key_loader: Callable[[], str | None],
         mode: LLMMode = "record",
         cassette: LLMCassette | None = None,
-        http_timeout_sec: float = 60.0,
+        http_timeout_sec: float = DEFAULT_HTTP_TIMEOUT_SEC,
         max_http_attempts: int = 3,
         backoff_base_sec: float = 2.0,
         max_total_requests: int | None = None,
@@ -271,6 +279,7 @@ class ResilientLLMSender:
             cached = self._cassette.get(req_sha)
             if cached is not None:
                 pt, ct, fin = _usage(cached)
+                truncated = fin == "length"
                 self._calls.append(
                     LLMCallRecord(
                         request_sha256=req_sha,
@@ -281,8 +290,12 @@ class ResilientLLMSender:
                         prompt_tokens=pt,
                         completion_tokens=ct,
                         finish_reason=fin,
+                        error_kind="truncated" if truncated else None,
+                        error=_TRUNCATED_MSG if truncated else None,
                     )
                 )
+                if truncated:
+                    raise LLMTransportError(_TRUNCATED_MSG)
                 return cached
             if self._mode == "replay":
                 self._calls.append(
@@ -350,6 +363,7 @@ class ResilientLLMSender:
                 continue
 
             pt, ct, fin = _usage(raw)
+            truncated = fin == "length"
             self._calls.append(
                 LLMCallRecord(
                     request_sha256=req_sha,
@@ -360,10 +374,14 @@ class ResilientLLMSender:
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     finish_reason=fin,
+                    error_kind="truncated" if truncated else None,
+                    error=_TRUNCATED_MSG if truncated else None,
                 )
             )
             if self._cassette is not None and self._mode == "record":
-                self._cassette.put(req_sha, payload, raw, self._model)
+                self._cassette.put(req_sha, payload, raw, self._model)  # kept for audit
+            if truncated:
+                raise LLMTransportError(_TRUNCATED_MSG)
             return raw
 
         self._calls.append(
@@ -386,7 +404,7 @@ class LLMBackend:
     sender: ResilientLLMSender
     model_name: str = DEFAULT_MODEL_NAME
     endpoint_url: str = DEFAULT_ENDPOINT_URL
-    max_tokens: int = 400
+    max_tokens: int = DEFAULT_MAX_TOKENS
     max_requests_per_trial: int = LLM_MAX_REQUESTS_PER_TRIAL
 
     def arm_config(self, config: GateHealConfig) -> GateHealConfig:

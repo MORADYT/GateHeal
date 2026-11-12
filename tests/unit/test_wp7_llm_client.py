@@ -117,7 +117,7 @@ def test_success_records_one_call_with_tokens_and_uses_bearer_key_and_own_timeou
     assert call.http_attempts == 1
     _data, headers, timeout = fake.requests[0]
     assert headers["authorization"] == f"Bearer {KEY}"
-    assert timeout == pytest.approx(60.0)  # not the proposer's 10 s action timeout
+    assert timeout == pytest.approx(120.0)  # not the proposer's 10 s action timeout
     assert sender.drain_calls() == ()  # drained
 
 
@@ -130,6 +130,44 @@ def test_retry_after_503_then_success_with_exponential_backoff() -> None:
     assert call.http_attempts == 3 and call.error_kind is None
     assert sleeps == [2.0, 4.0]
     assert sender.live_requests == 3
+
+
+def _truncated(content: str = "") -> str:
+    return json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {"content": content, "reasoning_content": "thinking..."},
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 3000, "completion_tokens": 400},
+        }
+    )
+
+
+def test_truncated_response_is_an_error_call_but_is_kept_in_the_cassette(tmp_path: Path) -> None:
+    path = tmp_path / "c.jsonl"
+    sender = _sender(_FakeUrlopen([_truncated()]), mode="record", cassette=LLMCassette(path))
+    with pytest.raises(LLMTransportError, match="truncated"):
+        sender(b"p", 10.0)
+    (call,) = sender.drain_calls()
+    assert call.error_kind == "truncated" and call.finish_reason == "length"
+    assert call.completion_tokens == 400 and call.response_sha256 is not None
+    assert len(LLMCassette(path)) == 1  # audit trail keeps the raw answer
+
+    replay = _sender(_FakeUrlopen([]), mode="replay", cassette=LLMCassette(path), key=None)
+    with pytest.raises(LLMTransportError, match="truncated"):
+        replay(b"p", 10.0)
+    (rcall,) = replay.drain_calls()
+    assert rcall.replayed and rcall.error_kind == "truncated"
+
+
+def test_partial_json_with_finish_reason_length_is_also_truncated() -> None:
+    sender = _sender(_FakeUrlopen([_truncated('{"proposals": [{"action_id": "rest')]))
+    with pytest.raises(LLMTransportError):
+        sender(b"p", 10.0)
+    assert sender.drain_calls()[0].error_kind == "truncated"
 
 
 def test_network_error_backoff_then_success() -> None:
@@ -298,7 +336,8 @@ def test_both_arms_get_the_same_request_settings_and_budget() -> None:
     assert info.max_tokens == 321 and info.temperature == 0.0
     assert info.provider_host == "api.deepseek.com"
     assert info.system_prompt_sha256 == system_prompt_sha256(arm_cfg)
-    assert info.mode == "live" and info.http_timeout_sec == pytest.approx(60.0)
+    assert info.mode == "live" and info.http_timeout_sec == pytest.approx(120.0)
+    assert LLMBackend(sender=_sender(_FakeUrlopen([]))).max_tokens == 4000
     dumped = info.model_dump_json()
     assert KEY not in dumped
 
