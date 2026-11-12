@@ -10,12 +10,26 @@ from pathlib import Path
 
 from gateheal.config import load_config
 from gateheal.controller import default_artifacts_dir
+from gateheal.llm import (
+    DEFAULT_API_KEY_ENV,
+    DEFAULT_ENDPOINT_URL,
+    DEFAULT_MODEL_NAME,
+    LLMBackend,
+    LLMBudgetExceeded,
+    LLMCassette,
+    LLMFatalError,
+    LLMMode,
+    ResilientLLMSender,
+    env_api_key_loader,
+)
 from gateheal.oracle import MIN_ORACLE_HOLD_WINDOW_SEC
 from gateheal.reporting import WP6ReportGenerator
 from gateheal.transport import SSHLabTransport, TransportUnavailableError
 from gateheal.wp6_engine import (
     ALL_WP6_ARMS,
     DEFAULT_MAX_TRIAL_ATTEMPTS,
+    KNOWN_ARMS,
+    LLM_ARMS,
     WP6ExperimentRunner,
     build_wp6_campaign_manifest,
     build_wp6_expectations,
@@ -30,8 +44,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wp6_run_campaign",
         description=(
-            "Run WP6 paired live-lab experiment campaign across arms "
-            "B0, B1, B2, G, G-nobr, and G-nosoak."
+            "Run a paired live-lab experiment campaign. Default arms: B0, B1, B2, G, G-nobr, "
+            "G-nosoak. WP7 adds B2-LLM and G-LLM (select with --arms)."
         ),
     )
     repo_root = Path(__file__).resolve().parents[2]
@@ -99,6 +113,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Settle wait after reset_lab.sh and fault injection.",
     )
     parser.add_argument(
+        "--arms",
+        type=str,
+        default=",".join(ALL_WP6_ARMS),
+        help=(
+            "Comma-separated arms to run (default: the six WP6 arms). "
+            f"Known: {', '.join(KNOWN_ARMS)}. Use the same --seed and repeat count for a "
+            "separate LLM campaign so its trials pair with the baseline ones."
+        ),
+    )
+    parser.add_argument(
+        "--llm-endpoint",
+        type=str,
+        default=DEFAULT_ENDPOINT_URL,
+        help="OpenAI-compatible chat-completions URL (default: DeepSeek).",
+    )
+    parser.add_argument("--llm-model", type=str, default=DEFAULT_MODEL_NAME)
+    parser.add_argument(
+        "--llm-api-key-env",
+        type=str,
+        default=DEFAULT_API_KEY_ENV,
+        help="Name of the environment variable holding the API key (the key is never stored).",
+    )
+    parser.add_argument(
+        "--llm-mode",
+        choices=("live", "record", "replay"),
+        default="record",
+        help="live: call the API, no cassette; record: call the API and append to the cassette; "
+        "replay: answer only from the cassette, never call the API (default: record).",
+    )
+    parser.add_argument(
+        "--llm-cassette",
+        type=Path,
+        default=None,
+        help="Cassette JSONL (default: <output-dir>/llm_cassette.jsonl).",
+    )
+    parser.add_argument(
+        "--llm-max-total-requests",
+        type=int,
+        default=1500,
+        help="Hard cap on live HTTP requests (retries included) for this process.",
+    )
+    parser.add_argument("--llm-max-tokens", type=int, default=400)
+    parser.add_argument(
+        "--llm-http-timeout-sec",
+        type=float,
+        default=60.0,
+        help="Per-request HTTP timeout. LLM latency counts toward measured unavailability.",
+    )
+    parser.add_argument(
         "--allow-dirty",
         action="store_true",
         help="Allow running on a dirty git working tree.",
@@ -139,6 +202,22 @@ def main(argv: list[str] | None = None) -> int:
             f"--hold-window-sec must be >= {MIN_ORACLE_HOLD_WINDOW_SEC}."
         )
 
+    arms = tuple(a.strip() for a in str(args.arms).split(",") if a.strip())
+    unknown = [a for a in arms if a not in KNOWN_ARMS]
+    if not arms or unknown or len(set(arms)) != len(arms):
+        raise ValueError(f"--arms must be distinct names from {KNOWN_ARMS}; got {args.arms!r}.")
+    uses_llm = any(a in LLM_ARMS for a in arms)
+    if uses_llm and args.llm_mode in ("live", "record"):
+        if not os.environ.get(args.llm_api_key_env, "").strip():
+            print(
+                f"ERROR: environment variable {args.llm_api_key_env} is not set. "
+                f"Run: export {args.llm_api_key_env}=... (do not put the key in a file).",
+                file=sys.stderr,
+            )
+            return 2
+    if args.llm_max_total_requests < 1 or args.llm_max_tokens < 1:
+        raise ValueError("--llm-max-total-requests and --llm-max-tokens must be >= 1.")
+
     repo_root = Path(__file__).resolve().parents[2]
     _ = validate_wp6_preflight(
         repo_root=repo_root,
@@ -176,6 +255,28 @@ def main(argv: list[str] | None = None) -> int:
     out_dir: Path = args.output_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    llm_backend: LLMBackend | None = None
+    if uses_llm:
+        llm_mode: LLMMode = args.llm_mode
+        cassette_path: Path = (
+            args.llm_cassette if args.llm_cassette is not None else out_dir / "llm_cassette.jsonl"
+        )
+        sender = ResilientLLMSender(
+            endpoint_url=args.llm_endpoint,
+            model_name=args.llm_model,
+            api_key_loader=env_api_key_loader(args.llm_api_key_env),
+            mode=llm_mode,
+            cassette=None if llm_mode == "live" else LLMCassette(cassette_path),
+            http_timeout_sec=args.llm_http_timeout_sec,
+            max_total_requests=args.llm_max_total_requests,
+        )
+        llm_backend = LLMBackend(
+            sender=sender,
+            model_name=args.llm_model,
+            endpoint_url=args.llm_endpoint,
+            max_tokens=args.llm_max_tokens,
+        )
+
     runner = WP6ExperimentRunner(
         cfg,
         controller_transport=controller_transport,
@@ -188,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         settle_wait_sec=args.settle_wait_sec,
         max_trial_attempts=args.max_trial_attempts,
         verbose_progress=True,
+        llm_backend=llm_backend,
     )
 
     manifest_path = out_dir / "wp6_manifest.json"
@@ -198,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config,
             wp5_manifest_path=args.wp5_manifest,
             seed=args.seed,
-            arms=ALL_WP6_ARMS,
+            arms=arms,
             scenarios=scen_ids,
             trials_per_scenario=effective_trials,
             oracle_hold_window_sec=args.hold_window_sec,
@@ -206,13 +308,14 @@ def main(argv: list[str] | None = None) -> int:
             max_trial_attempts=args.max_trial_attempts,
             completed_trials=completed,
             allow_dirty=bool(args.allow_dirty),
+            llm_info=None if llm_backend is None else llm_backend.describe(cfg),
         )
         manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
     # Written before the first trial so that an interrupted campaign still has its provenance.
     already_done = len(load_completed_wp6_trials(runner.trials_jsonl_path))
     write_manifest(already_done)
-    planned = count_planned_trials(scen_ids, ALL_WP6_ARMS, effective_trials)
+    planned = count_planned_trials(scen_ids, arms, effective_trials)
     print(
         f"WP6: {planned} planned trials, {already_done} already on disk (resume re-runs "
         "non-evaluable ones).",
@@ -223,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         records = runner.run_campaign(
             trials_per_scenario=effective_trials,
             seed=args.seed,
-            arms=ALL_WP6_ARMS,
+            arms=arms,
             expectations=expectations,
         )
     except TransportUnavailableError as exc:
@@ -236,6 +339,21 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    except LLMBudgetExceeded as exc:
+        print(f"STOPPED: {exc}", file=sys.stderr)
+        print(
+            "Completed trials are in trials.jsonl; re-run the same command (optionally with a "
+            "higher --llm-max-total-requests) to resume.",
+            file=sys.stderr,
+        )
+        return 3
+    except LLMFatalError as exc:
+        print(f"STOPPED: LLM provider problem: {exc}", file=sys.stderr)
+        print(
+            "Fix the key/balance and re-run the same command to resume; nothing was scored.",
+            file=sys.stderr,
+        )
+        return 4
     except KeyboardInterrupt:
         print(
             "Interrupted. Completed trials are already in trials.jsonl; re-run the same command "
@@ -263,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
         records,
         trials_per_scenario=effective_trials,
         seed=args.seed,
-        arms=ALL_WP6_ARMS,
+        arms=arms,
         scenarios=scen_ids,
     )
     reporter = WP6ReportGenerator(summary)
@@ -281,6 +399,15 @@ def main(argv: list[str] | None = None) -> int:
             f"  {item.hypothesis_id}: raw p={item.raw_p_value:.4g} "
             f"adjusted p={item.adjusted_p_value:.4g} rejected={item.rejected}"
         )
+    if summary.llm_holm_family:
+        print("\nLLM family (H4a-H4c, Holm over three):")
+        for item in summary.llm_holm_family:
+            print(
+                f"  {item.hypothesis_id}: raw p={item.raw_p_value:.4g} "
+                f"adjusted p={item.adjusted_p_value:.4g} rejected={item.rejected}"
+            )
+    if llm_backend is not None:
+        print(f"\nLive LLM requests this run: {llm_backend.sender.live_requests}")
     print(f"\nArtifacts written to {out_dir} (summary.json, report.md, table.tex).")
     return 0
 

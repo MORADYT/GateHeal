@@ -237,6 +237,7 @@ class WP6ReportGenerator:
             [
                 "Arm", "Ungated", "Planned", "Completed", "Evaluable", "Non-evaluable",
                 "Not run", "Retried", "Mutating", "Abstained", "Observe/no-op",
+                "LLM calls", "LLM tokens",
             ],
             [
                 [
@@ -244,7 +245,7 @@ class WP6ReportGenerator:
                     str(c.completed_trials), str(c.evaluable_trials),
                     str(c.non_evaluable_trials), str(c.not_run_trials), str(c.retried_trials),
                     str(c.mutating_trials), str(c.abstained_trials),
-                    str(c.observe_only_or_noop_trials),
+                    str(c.observe_only_or_noop_trials), str(c.llm_calls), str(c.llm_tokens),
                 ]
                 for arm, c in s.coverage.items()
             ],
@@ -314,7 +315,8 @@ class WP6ReportGenerator:
         lines += ["", "## 6. Secondary comparisons (uncorrected, descriptive)", ""]
         lines += render_markdown_table(
             [
-                "Comparison", "Harm pairs", "Dropped pairs", "Harm rate G", "Harm rate other",
+                "Comparison", "Harm pairs", "Dropped pairs", "Harm rate (first arm)",
+                "Harm rate (second arm)",
                 "McNemar p (two-sided)", "Unavail. pairs", "Wilcoxon p (unavail.)",
                 "Wilcoxon method", "Unavail. diff [95% CI] (s)",
             ],
@@ -335,7 +337,55 @@ class WP6ReportGenerator:
         )
 
         lines += ["", "## 7. LaTeX table", "", "```latex", self.render_latex_table(), "```", ""]
+        lines += self._render_llm_section()
         return "\n".join(lines)
+
+    def _render_llm_section(self) -> list[str]:
+        """Section 8: the WP7 LLM family. Empty when the campaign had no LLM arms."""
+        s = self._summary
+        if not s.llm_primary_comparisons:
+            return []
+        llm_holm = {h.hypothesis_id: h for h in s.llm_holm_family}
+        lines = [
+            "## 8. LLM family (WP7, pre-registered secondary family; Holm over H4a-H4c)",
+            "",
+            "Both LLM arms receive the identical prompt and model output; only the policy gate "
+            "differs. These tests are separate from, and do not alter, the frozen H1-H3 family.",
+            "",
+        ]
+        lines += render_markdown_table(
+            [
+                "Comparison", "Hypothesis", "Test", "Pairs", "Dropped pairs", "Rate G-LLM",
+                "Rate B2-LLM", "Diff (G-LLM - B2-LLM)", "p (raw)", "p (Holm, family of 3)",
+                "Rejected",
+            ],
+            [
+                [
+                    f"`{c.comparison_id}`", c.hypothesis_id, f"`{c.test}`", str(c.n_pairs),
+                    str(c.n_dropped_pairs), f"{c.rate_a:.3f}", f"{c.rate_b:.3f}",
+                    f"{c.rate_diff_a_minus_b:+.3f}", f"{c.p_value:.4g}",
+                    f"{llm_holm[c.hypothesis_id].adjusted_p_value:.4g}",
+                    str(llm_holm[c.hypothesis_id].rejected).lower(),
+                ]
+                for c in s.llm_primary_comparisons
+            ],
+        )
+        for c in s.llm_primary_comparisons:
+            if c.noninferiority is not None:
+                ni = c.noninferiority
+                lines += [
+                    "",
+                    f"H4b detail: difference {ni.difference:+.3f}, Newcombe lower bound "
+                    f"{ni.lower_bound:+.3f}, margin -{ni.margin:.2f}, "
+                    f"non-inferior = `{str(ni.non_inferior).lower()}`.",
+                ]
+        lines += [
+            "",
+            "G-LLM vs G and B2-LLM vs B2 appear in section 6 as descriptive comparisons. LLM "
+            "latency counts toward measured unavailability.",
+            "",
+        ]
+        return lines
 
     def write_artifacts(self, output_dir: Path) -> tuple[Path, Path, Path]:
         """Write summary.json, report.md and table.tex into output_dir."""

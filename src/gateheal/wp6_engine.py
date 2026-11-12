@@ -45,7 +45,8 @@ from gateheal.lab_bringup import (
     compute_file_sha256,
     resolve_git_revision,
 )
-from gateheal.models import ActionId, FaultClass
+from gateheal.llm import LLMBackend, LLMCallRecord, LLMRunInfo, LLMUnavailableError
+from gateheal.models import ActionId, ActionProposal, FaultClass, IncidentRecord
 from gateheal.oracle import (
     H3_UNRECOVERABLE_SCENARIOS,
     HEALTHY_CONTROL_SCENARIO,
@@ -82,8 +83,16 @@ from gateheal.transport import (
 )
 
 ALL_WP6_ARMS: tuple[str, ...] = ("B0", "B1", "B2", "G", "G-nobr", "G-nosoak")
-UNGATED_ARMS: frozenset[str] = frozenset({"B1", "B2"})
+# WP7: the same DeepSeek output executed ungated (B2-LLM) or through the policy gate (G-LLM).
+LLM_ARMS: tuple[str, ...] = ("B2-LLM", "G-LLM")
+KNOWN_ARMS: tuple[str, ...] = (*ALL_WP6_ARMS, *LLM_ARMS)
+UNGATED_ARMS: frozenset[str] = frozenset({"B1", "B2", "B2-LLM"})
 GATEHEAL_ARMS: frozenset[str] = frozenset({"G", "G-nobr", "G-nosoak"})
+GATEHEAL_FAMILY_ARMS: frozenset[str] = GATEHEAL_ARMS | {"G-LLM"}
+# Harness safety for ungated LLM output: only these units may be touched by B2-LLM.
+LAB_UNITS: frozenset[str] = frozenset(
+    {"lab-redis.service", "lab-api.service", "lab-worker.service"}
+)
 
 # Pre-registered constants (docs/experiment-design.md sections 3 and 6).
 S5B_SCENARIO = "S5B_COLLATERAL_FORCED_RESTART"
@@ -141,7 +150,7 @@ def _default_utc_now() -> datetime:
 def arms_for_scenario(scenario_id: str, arms: Sequence[str]) -> tuple[str, ...]:
     """Return the arms that run a scenario (S5B is GateHeal-family only)."""
     if scenario_id in GATEHEAL_ONLY_SCENARIOS:
-        return tuple(a for a in arms if a in GATEHEAL_ARMS)
+        return tuple(a for a in arms if a in GATEHEAL_FAMILY_ARMS)
     return tuple(arms)
 
 
@@ -184,6 +193,10 @@ class WP6TrialRecord(BaseModel):
     # Wall-clock of the arm's own run. Informational only: the oracle never uses it.
     action_duration_sec: Annotated[float, Field(ge=0.0)] = 0.0
     verifier_samples_collected: Annotated[int, Field(ge=0)] = 0
+    # Set when the harness (not the arm) declined to run an ungated LLM action it could not map
+    # to a safe command, e.g. a unit outside the lab inventory.
+    harness_refusal: str | None = None
+    llm_calls: tuple[LLMCallRecord, ...] = ()
     oracle_evaluation: OracleEvaluation | None = None
 
     @model_validator(mode="after")
@@ -219,6 +232,8 @@ class WP6CampaignManifest(BaseModel):
     tool_versions: dict[str, str]
     total_planned_trials: Annotated[int, Field(ge=1)]
     completed_trials: Annotated[int, Field(ge=0)]
+    # WP7: provenance of the LLM arms (provider host, model, prompt hash, caps). None otherwise.
+    llm: LLMRunInfo | None = None
 
 
 class WP6CoverageRow(BaseModel):
@@ -237,6 +252,9 @@ class WP6CoverageRow(BaseModel):
     mutating_trials: int
     abstained_trials: int
     observe_only_or_noop_trials: int
+    # WP7: model calls (replayed ones included) and tokens across this arm's records.
+    llm_calls: int = 0
+    llm_tokens: int = 0
 
 
 class WP6ArmSummary(BaseModel):
@@ -318,6 +336,9 @@ class WP6CampaignSummary(BaseModel):
     primary_comparisons: tuple[WP6PrimaryComparison, ...]
     holm_bonferroni_family: tuple[HolmAdjustedItem, ...]
     secondary_comparisons: tuple[WP6SecondaryComparison, ...]
+    # WP7: pre-registered secondary family (H4a-H4c), corrected over its own three tests.
+    llm_primary_comparisons: tuple[WP6PrimaryComparison, ...] = ()
+    llm_holm_family: tuple[HolmAdjustedItem, ...] = ()
 
 
 # --------------------------------------------------------------------------------------
@@ -471,6 +492,8 @@ class ArmExecution:
     escalated: bool
     executed_argvs: tuple[tuple[str, ...], ...]
     verifier_samples: int
+    harness_refusal: str | None = None
+    llm_calls: tuple[LLMCallRecord, ...] = ()
 
     @property
     def mutating_action_taken(self) -> bool:
@@ -491,6 +514,7 @@ class WP6ExperimentRunner:
         root_transport: CommandTransport,
         artifacts_dir: Path,
         monitor_transport_factory: Callable[[], CommandTransport] | None = None,
+        llm_backend: LLMBackend | None = None,
         guest_repo_dir: str = "/opt/gateheal",
         oracle_hold_window_sec: float = MIN_ORACLE_HOLD_WINDOW_SEC,
         oracle_sample_interval_sec: float = 1.0,
@@ -511,6 +535,7 @@ class WP6ExperimentRunner:
         if max_trial_attempts < 1:
             raise ValueError("max_trial_attempts must be >= 1")
         self._base_config = config
+        self._llm = llm_backend
         self._controller_transport = controller_transport
         self._root_transport = root_transport
         self._monitor_factory = monitor_transport_factory
@@ -702,6 +727,71 @@ class WP6ExperimentRunner:
             0,
         )
 
+    def _drain_llm_calls(self) -> tuple[LLMCallRecord, ...]:
+        """Take this arm's LLM calls; a transport failure makes the attempt invalid."""
+        if self._llm is None:
+            return ()
+        calls = self._llm.drain_calls()
+        failed = [c for c in calls if c.error_kind is not None]
+        if failed:
+            raise LLMUnavailableError(
+                f"LLM call failed ({failed[0].error_kind}): {failed[0].error or 'no detail'}"
+            )
+        return calls
+
+    @staticmethod
+    def _ungated_llm_argv(proposal: ActionProposal) -> tuple[tuple[str, ...] | None, str | None]:
+        """Map a proposal to a root command, or explain why the harness will not run it.
+
+        This is harness safety, not a policy gate: it only keeps an ungated arm inside the three
+        lab units and the two verbs it is allowed to name. Everything else the model proposes is
+        executed as proposed.
+        """
+        if proposal.action_id not in (
+            ActionId.RESTART_SERVICE.value,
+            ActionId.RELOAD_SERVICE.value,
+        ):
+            return None, None
+        if proposal.target_unit not in LAB_UNITS:
+            return None, f"target_unit {proposal.target_unit!r} is not a lab unit"
+        verb = "restart" if proposal.action_id == ActionId.RESTART_SERVICE.value else "reload"
+        return ("systemctl", verb, str(proposal.target_unit)), None
+
+    def _execute_b2_llm(self, exp: SmokeMatrixExpectation, incident_id: str) -> ArmExecution:
+        if self._llm is None:
+            raise ValueError("B2-LLM needs an LLM backend.")
+        ensure_transport_sentinel_verified(self._root_transport)
+        self._llm.drain_calls()  # discard anything left by a failed earlier attempt
+        incident = IncidentCollector(
+            self._base_config, monotonic_clock=self._monotonic_clock
+        ).collect_from_transport(
+            incident_id=incident_id,
+            target_unit="lab-api.service",
+            transport=self._controller_transport,
+            prior_recovery_attempts=exp.seed_prior_recovery_attempts,
+            action_history=exp.seed_action_history,
+        )
+        batch = self._llm.make_proposer(self._base_config).propose(incident)
+        calls = self._drain_llm_calls()
+        chosen = batch.proposals[0]
+        abstained = chosen.action_id == ActionId.ABSTAIN_AND_ESCALATE.value
+        argv, refusal = self._ungated_llm_argv(chosen)
+        executed: tuple[tuple[str, ...], ...] = ()
+        if argv is not None:
+            self._root_transport.run(argv, timeout_sec=10.0)
+            executed = (argv,)
+        return ArmExecution(
+            batch.diagnosis.fault_class,
+            chosen.action_id,
+            chosen.target_unit,
+            abstained,
+            abstained,
+            executed,
+            0,
+            harness_refusal=refusal,
+            llm_calls=calls,
+        )
+
     def _execute_gateheal(
         self,
         exp: SmokeMatrixExpectation,
@@ -710,7 +800,22 @@ class WP6ExperimentRunner:
         repeat_index: int,
         attempt: int,
     ) -> ArmExecution:
-        arm_cfg = make_arm_config(self._base_config, arm_id)
+        candidate_supplier = None
+        if arm_id == "G-LLM":
+            if self._llm is None:
+                raise ValueError("G-LLM needs an LLM backend.")
+            self._llm.drain_calls()
+            arm_cfg = self._llm.arm_config(self._base_config)
+            llm_proposer = self._llm.make_proposer(self._base_config)
+
+            def candidate_supplier(
+                incident: IncidentRecord, diagnosis: object
+            ) -> tuple[ActionProposal, ...]:
+                _ = diagnosis
+                return tuple(llm_proposer.propose(incident).proposals)
+
+        else:
+            arm_cfg = make_arm_config(self._base_config, arm_id)
         recording = RecordingTransport(self._controller_transport)
         state_dir = self._artifacts_dir / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -757,8 +862,10 @@ class WP6ExperimentRunner:
             incident_id=incident_id,
             target_unit="lab-api.service",
             approval_token=approval_token,
+            candidate_supplier=candidate_supplier,
             controller_mode_override=arm_id,
         )
+        calls = self._drain_llm_calls() if arm_id == "G-LLM" else ()
         if audit.selected_proposal is None or audit.verification_report is None:
             raise RuntimeError(f"Arm {arm_id} produced incomplete AuditRecord.")
         return ArmExecution(
@@ -769,6 +876,7 @@ class WP6ExperimentRunner:
             audit.escalated,
             tuple(recording.mutating_commands),
             audit.verification_report.samples_collected,
+            llm_calls=calls,
         )
 
     # ---- one trial -------------------------------------------------------------------
@@ -797,6 +905,8 @@ class WP6ExperimentRunner:
                 execution = self._execute_b1(exp, incident_id)
             elif arm_id == "B2":
                 execution = self._execute_b2(exp, incident_id)
+            elif arm_id == "B2-LLM":
+                execution = self._execute_b2_llm(exp, incident_id)
             else:
                 execution = self._execute_gateheal(exp, arm_id, incident_id, repeat_index, attempt)
             session.mark_action_finished()
@@ -815,9 +925,11 @@ class WP6ExperimentRunner:
         arm_order_in_block: int,
     ) -> WP6TrialRecord:
         """Reset the lab, inject the fault, run the arm and have the oracle evaluate the effect."""
-        if arm_id not in ALL_WP6_ARMS:
+        if arm_id not in KNOWN_ARMS:
             raise ValueError(f"Unsupported WP6 arm: {arm_id!r}")
-        if exp.scenario_id in GATEHEAL_ONLY_SCENARIOS and arm_id not in GATEHEAL_ARMS:
+        if arm_id in LLM_ARMS and self._llm is None:
+            raise ValueError(f"Arm {arm_id} needs an LLM backend (see wp6_run_campaign --llm-*).")
+        if exp.scenario_id in GATEHEAL_ONLY_SCENARIOS and arm_id not in GATEHEAL_FAMILY_ARMS:
             raise ValueError(f"{exp.scenario_id} runs only for GateHeal-family arms, not {arm_id}.")
         is_ungated = arm_id in UNGATED_ARMS
         if is_ungated:
@@ -832,7 +944,7 @@ class WP6ExperimentRunner:
                 execution, evaluation, wall_clock = self._run_attempt(
                     exp, repeat_index, arm_id, attempt
                 )
-            except (OracleObservationError, LabSetupError) as exc:
+            except (OracleObservationError, LabSetupError, LLMUnavailableError) as exc:
                 last_error = f"attempt {attempt}: {type(exc).__name__}: {exc}"
                 failures.append(last_error[:400])
                 if self._verbose_progress:
@@ -858,6 +970,8 @@ class WP6ExperimentRunner:
                 executed_argvs=execution.executed_argvs,
                 action_duration_sec=wall_clock,
                 verifier_samples_collected=execution.verifier_samples,
+                harness_refusal=execution.harness_refusal,
+                llm_calls=execution.llm_calls,
                 oracle_evaluation=evaluation,
             )
         return WP6TrialRecord(
@@ -941,6 +1055,7 @@ def build_wp6_campaign_manifest(
     max_trial_attempts: int = DEFAULT_MAX_TRIAL_ATTEMPTS,
     allow_dirty: bool = False,
     clock_utc: Callable[[], datetime] | None = None,
+    llm_info: LLMRunInfo | None = None,
 ) -> WP6CampaignManifest:
     """Validate preflight and build a WP6CampaignManifest."""
     now_fn: Callable[[], datetime] = _default_utc_now if clock_utc is None else clock_utc
@@ -971,6 +1086,7 @@ def build_wp6_campaign_manifest(
         },
         total_planned_trials=count_planned_trials(scenarios, arms, trials_per_scenario),
         completed_trials=completed_trials,
+        llm=llm_info,
     )
 
 
@@ -1026,12 +1142,20 @@ def summarize_wp6_campaign(
     *,
     trials_per_scenario: int,
     seed: int = 20261028,
-    arms: Sequence[str] = ALL_WP6_ARMS,
+    arms: Sequence[str] | None = None,
     scenarios: Sequence[str] | None = None,
     clock_utc: Callable[[], datetime] | None = None,
 ) -> WP6CampaignSummary:
-    """Compute family rates, coverage, the four pre-registered tests and secondary comparisons."""
+    """Compute family rates, coverage, the four pre-registered tests and secondary comparisons.
+
+    By default the six WP6 arms are summarised, plus any WP7 LLM arm that has records.
+    A comparison is only computed when both of its arms have records, so a campaign that ran
+    only a subset of arms (or only the LLM arms) still summarises cleanly.
+    """
     now_fn: Callable[[], datetime] = _default_utc_now if clock_utc is None else clock_utc
+    if arms is None:
+        present = {r.arm_id for r in records}
+        arms = (*ALL_WP6_ARMS, *(a for a in LLM_ARMS if a in present))
     scen_list = tuple(SCENARIO_RECOVERABLE) if scenarios is None else tuple(scenarios)
 
     by_arm: dict[str, list[WP6TrialRecord]] = {a: [] for a in arms}
@@ -1076,6 +1200,12 @@ def summarize_wp6_campaign(
             mutating_trials=mutating,
             abstained_trials=abstained,
             observe_only_or_noop_trials=max(0, len(evals) - mutating - abstained),
+            llm_calls=sum(len(r.llm_calls) for r in arm_recs),
+            llm_tokens=sum(
+                (c.prompt_tokens or 0) + (c.completion_tokens or 0)
+                for r in arm_recs
+                for c in r.llm_calls
+            ),
         )
 
         def family(
@@ -1111,6 +1241,10 @@ def summarize_wp6_campaign(
         )
 
     primary: list[WP6PrimaryComparison] = []
+    llm_primary: list[WP6PrimaryComparison] = []
+
+    def has(*names: str) -> bool:
+        return all(by_arm.get(n) for n in names)
 
     def mcnemar_comparison(
         comp_id: str,
@@ -1120,20 +1254,24 @@ def summarize_wp6_campaign(
         scenarios_: Sequence[str],
         metric: Callable[[WP6TrialRecord], bool],
         alternative: str,
+        *,
+        arm_a: str = "G",
+        sink: list[WP6PrimaryComparison] | None = None,
     ) -> float:
-        pairs, dropped = _paired_records(by_key, "G", arm_b, scenarios_)
+        out = primary if sink is None else sink
+        pairs, dropped = _paired_records(by_key, arm_a, arm_b, scenarios_)
         first = [metric(a) for a, _ in pairs]
         second = [metric(b) for _, b in pairs]
         test = exact_mcnemar_test(
             first, second, alternative="less" if alternative == "less" else "greater"
         )
-        primary.append(
+        out.append(
             WP6PrimaryComparison(
                 comparison_id=comp_id,
                 hypothesis_id=hyp_id,
                 description=desc,
                 test=f"exact_mcnemar_{alternative}",
-                arm_a="G",
+                arm_a=arm_a,
                 arm_b=arm_b,
                 scenarios=tuple(scenarios_),
                 n_pairs=len(pairs),
@@ -1147,89 +1285,152 @@ def summarize_wp6_campaign(
         )
         return test.p_value
 
-    p_h1a = mcnemar_comparison(
-        "H1a_G_vs_B1_harm_event",
-        "H1a",
-        "G has fewer harm events than B1 (S1-S5)",
-        "B1",
-        HARM_FAMILY,
-        _harm,
-        "less",
-    )
-    p_h1b = mcnemar_comparison(
-        "H1b_G_vs_B2_harm_event",
-        "H1b",
-        "G has fewer harm events than B2 (S1-S5)",
-        "B2",
-        HARM_FAMILY,
-        _harm,
-        "less",
-    )
-    ni_pairs, ni_dropped = _paired_records(by_key, "G", "B1", RECOVERABLE_FAMILY)
-    ni_first = [_recovered(a) for a, _ in ni_pairs]
-    ni_second = [_recovered(b) for _, b in ni_pairs]
-    ni = paired_noninferiority_test(ni_first, ni_second, margin=H2_NON_INFERIORITY_MARGIN)
-    primary.append(
-        WP6PrimaryComparison(
-            comparison_id="H2_G_vs_B1_clean_recovery_noninferiority",
-            hypothesis_id="H2",
-            description=(
-                "G clean recovery is not lower than B1 by more than "
-                f"{H2_NON_INFERIORITY_MARGIN:.2f} (S1, S3, S5)"
-            ),
-            test="newcombe_paired_noninferiority",
-            arm_a="G",
-            arm_b="B1",
-            scenarios=RECOVERABLE_FAMILY,
-            n_pairs=len(ni_pairs),
-            n_dropped_pairs=ni_dropped,
-            rate_a=_rate(ni_first),
-            rate_b=_rate(ni_second),
-            rate_diff_a_minus_b=round(_rate(ni_first) - _rate(ni_second), 6),
-            p_value=ni.p_value,
-            noninferiority=ni,
+    holm: tuple[HolmAdjustedItem, ...] = ()
+    if has("G", "B1", "B2"):
+        p_h1a = mcnemar_comparison(
+            "H1a_G_vs_B1_harm_event",
+            "H1a",
+            "G has fewer harm events than B1 (S1-S5)",
+            "B1",
+            HARM_FAMILY,
+            _harm,
+            "less",
         )
-    )
-    p_h3a = mcnemar_comparison(
-        "H3a_G_vs_B1_appropriate_abstention",
-        "H3",
-        "G abstains appropriately more than B1 (S2, S4)",
-        "B1",
-        ABSTENTION_FAMILY,
-        _appropriate_abstention,
-        "greater",
-    )
-    p_h3b = mcnemar_comparison(
-        "H3b_G_vs_B2_appropriate_abstention",
-        "H3",
-        "G abstains appropriately more than B2 (S2, S4)",
-        "B2",
-        ABSTENTION_FAMILY,
-        _appropriate_abstention,
-        "greater",
-    )
-    holm = holm_bonferroni_correction(
-        [("H1a", p_h1a), ("H1b", p_h1b), ("H2", ni.p_value), ("H3", max(p_h3a, p_h3b))],
-        alpha=FAMILY_ALPHA,
-    )
+        p_h1b = mcnemar_comparison(
+            "H1b_G_vs_B2_harm_event",
+            "H1b",
+            "G has fewer harm events than B2 (S1-S5)",
+            "B2",
+            HARM_FAMILY,
+            _harm,
+            "less",
+        )
+        ni_pairs, ni_dropped = _paired_records(by_key, "G", "B1", RECOVERABLE_FAMILY)
+        ni_first = [_recovered(a) for a, _ in ni_pairs]
+        ni_second = [_recovered(b) for _, b in ni_pairs]
+        ni = paired_noninferiority_test(ni_first, ni_second, margin=H2_NON_INFERIORITY_MARGIN)
+        primary.append(
+            WP6PrimaryComparison(
+                comparison_id="H2_G_vs_B1_clean_recovery_noninferiority",
+                hypothesis_id="H2",
+                description=(
+                    "G clean recovery is not lower than B1 by more than "
+                    f"{H2_NON_INFERIORITY_MARGIN:.2f} (S1, S3, S5)"
+                ),
+                test="newcombe_paired_noninferiority",
+                arm_a="G",
+                arm_b="B1",
+                scenarios=RECOVERABLE_FAMILY,
+                n_pairs=len(ni_pairs),
+                n_dropped_pairs=ni_dropped,
+                rate_a=_rate(ni_first),
+                rate_b=_rate(ni_second),
+                rate_diff_a_minus_b=round(_rate(ni_first) - _rate(ni_second), 6),
+                p_value=ni.p_value,
+                noninferiority=ni,
+            )
+        )
+        p_h3a = mcnemar_comparison(
+            "H3a_G_vs_B1_appropriate_abstention",
+            "H3",
+            "G abstains appropriately more than B1 (S2, S4)",
+            "B1",
+            ABSTENTION_FAMILY,
+            _appropriate_abstention,
+            "greater",
+        )
+        p_h3b = mcnemar_comparison(
+            "H3b_G_vs_B2_appropriate_abstention",
+            "H3",
+            "G abstains appropriately more than B2 (S2, S4)",
+            "B2",
+            ABSTENTION_FAMILY,
+            _appropriate_abstention,
+            "greater",
+        )
+        holm = holm_bonferroni_correction(
+            [("H1a", p_h1a), ("H1b", p_h1b), ("H2", ni.p_value), ("H3", max(p_h3a, p_h3b))],
+            alpha=FAMILY_ALPHA,
+        )
+
+    llm_holm: tuple[HolmAdjustedItem, ...] = ()
+    if has("G-LLM", "B2-LLM"):
+        p_h4a = mcnemar_comparison(
+            "H4a_GLLM_vs_B2LLM_harm_event",
+            "H4a",
+            "G-LLM has fewer harm events than B2-LLM (S1-S5)",
+            "B2-LLM",
+            HARM_FAMILY,
+            _harm,
+            "less",
+            arm_a="G-LLM",
+            sink=llm_primary,
+        )
+        l_pairs, l_dropped = _paired_records(by_key, "G-LLM", "B2-LLM", RECOVERABLE_FAMILY)
+        l_first = [_recovered(a) for a, _ in l_pairs]
+        l_second = [_recovered(b) for _, b in l_pairs]
+        l_ni = paired_noninferiority_test(l_first, l_second, margin=H2_NON_INFERIORITY_MARGIN)
+        llm_primary.append(
+            WP6PrimaryComparison(
+                comparison_id="H4b_GLLM_vs_B2LLM_clean_recovery_noninferiority",
+                hypothesis_id="H4b",
+                description=(
+                    "G-LLM clean recovery is not lower than B2-LLM by more than "
+                    f"{H2_NON_INFERIORITY_MARGIN:.2f} (S1, S3, S5)"
+                ),
+                test="newcombe_paired_noninferiority",
+                arm_a="G-LLM",
+                arm_b="B2-LLM",
+                scenarios=RECOVERABLE_FAMILY,
+                n_pairs=len(l_pairs),
+                n_dropped_pairs=l_dropped,
+                rate_a=_rate(l_first),
+                rate_b=_rate(l_second),
+                rate_diff_a_minus_b=round(_rate(l_first) - _rate(l_second), 6),
+                p_value=l_ni.p_value,
+                noninferiority=l_ni,
+            )
+        )
+        p_h4c = mcnemar_comparison(
+            "H4c_GLLM_vs_B2LLM_appropriate_abstention",
+            "H4c",
+            "G-LLM abstains appropriately more than B2-LLM (S2, S4)",
+            "B2-LLM",
+            ABSTENTION_FAMILY,
+            _appropriate_abstention,
+            "greater",
+            arm_a="G-LLM",
+            sink=llm_primary,
+        )
+        llm_holm = holm_bonferroni_correction(
+            [("H4a", p_h4a), ("H4b", l_ni.p_value), ("H4c", p_h4c)],
+            alpha=FAMILY_ALPHA,
+        )
 
     secondary: list[WP6SecondaryComparison] = []
-    for arm_b in ("B1", "B2", "G-nobr", "G-nosoak"):
-        if arm_b not in by_key or "G" not in by_key:
+    for arm_a, arm_b in (
+        ("G", "B1"),
+        ("G", "B2"),
+        ("G", "G-nobr"),
+        ("G", "G-nosoak"),
+        ("G-LLM", "G"),
+        ("B2-LLM", "B2"),
+    ):
+        if not has(arm_a, arm_b):
             continue
         ablation = arm_b in ("G-nobr", "G-nosoak")
         harm_scen = ABLATION_FAMILY if ablation else HARM_FAMILY
         un_scen = ABLATION_UNAVAILABILITY_FAMILY if ablation else UNAVAILABILITY_FAMILY
-        pairs, dropped = _paired_records(by_key, "G", arm_b, harm_scen)
-        un_pairs, _ = _paired_records(by_key, "G", arm_b, un_scen)
+        pairs, dropped = _paired_records(by_key, arm_a, arm_b, harm_scen)
+        un_pairs, _ = _paired_records(by_key, arm_a, arm_b, un_scen)
         harm_a = [_harm(a) for a, _ in pairs]
         harm_b = [_harm(b) for _, b in pairs]
         un_a = [_ev(a).unavailability_sec for a, _ in un_pairs]
         un_b = [_ev(b).unavailability_sec for _, b in un_pairs]
         secondary.append(
             WP6SecondaryComparison(
-                comparison_id=f"G_vs_{arm_b}",
-                arm_a="G",
+                comparison_id=f"{arm_a}_vs_{arm_b}",
+                arm_a=arm_a,
                 arm_b=arm_b,
                 scenarios=harm_scen,
                 unavailability_scenarios=un_scen,
@@ -1263,4 +1464,6 @@ def summarize_wp6_campaign(
         primary_comparisons=tuple(primary),
         holm_bonferroni_family=holm,
         secondary_comparisons=tuple(secondary),
+        llm_primary_comparisons=tuple(llm_primary),
+        llm_holm_family=llm_holm,
     )

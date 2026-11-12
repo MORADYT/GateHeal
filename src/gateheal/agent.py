@@ -208,6 +208,8 @@ class OpenAICompatibleAgentProposer:
         model_name: str = "llama3.1:8b",
         api_key: str = "ollama",
         http_sender: Callable[[bytes, float], str] | None = None,
+        system_prompt: str | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         self._config = config
         self._diagnosis_engine = DiagnosisEngine(config)
@@ -215,6 +217,10 @@ class OpenAICompatibleAgentProposer:
         self._model_name = model_name
         self._api_key = api_key
         self._http_sender = http_sender or self._default_http_sender
+        self._system_prompt = (
+            build_agent_system_prompt() if system_prompt is None else system_prompt
+        )
+        self._max_tokens = max_tokens
         self._requests_made = 0
 
     @property
@@ -256,15 +262,17 @@ class OpenAICompatibleAgentProposer:
             )
 
         self._requests_made += 1
-        request_body = {
+        request_body: dict[str, object] = {
             "model": self._model_name,
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": build_agent_system_prompt()},
-                {"role": "user", "content": json.dumps(incident.model_dump())},
+                {"role": "system", "content": self._system_prompt},
+                {"role": "user", "content": json.dumps(incident.model_dump(mode="json"))},
             ],
         }
+        if self._max_tokens is not None:
+            request_body["max_tokens"] = self._max_tokens
         payload = json.dumps(request_body).encode("utf-8")
         timeout = self._config.budgets.per_action_timeout_sec
 
