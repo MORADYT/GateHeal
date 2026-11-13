@@ -174,6 +174,13 @@ live run, so the following changes made before the full campaign are recorded he
   outcome, harm flag and unavailability of those two trials are identical to their 19 peers, and
   they belong to the G-family-only ablation set, not to H1-H3.
 * 2026-11-12: section 9 (WP7 LLM family) was added before any live LLM run. It does not alter H1-H3, the oracle or the baseline arms.
+* 2026-11-13 (second WP7 smoke run, before any WP7 data was analysed): with answers no longer
+  truncated, G-LLM recovered 5/9 against B2-LLM's 9/9. The recorded answers replayed through the
+  gate offline were approved, so the abstentions came from the 45 s incident budget being used up
+  while waiting for the model (answers took up to 87 s). The controller clock now excludes model
+  latency for G-LLM (see section 9), and the prompt no longer lists the disabled restore action
+  (`wp7-2`). Trial records also store `gate_rejection_codes` and `abort_reason`, which the first
+  records lacked. The smoke output was discarded. No hypothesis, endpoint or test changed.
 * 2026-11-12 (WP7 smoke run, before any WP7 data was analysed): `max_tokens` 400 truncated 31 of 42
   answers of the reasoning model, which were then scored as abstentions. The default is now 4000,
   a truncated answer is an invalid attempt, and the smoke output was discarded. No hypothesis,
@@ -185,7 +192,7 @@ The frozen H1-H3 family above is not changed. WP7 adds two arms and one *seconda
 three hypotheses, analysed on the same oracle, the same scenarios and the same seed.
 
 **Arms.** Both receive the same incident record and the same system prompt (`PROMPT_VERSION`
-`wp7-1`; its SHA-256 and the model, endpoint host, temperature, `max_tokens` and request budgets
+`wp7-2`; its SHA-256 and the model, endpoint host, temperature, `max_tokens` and request budgets
 are stored in `wp6_manifest.json`). Only the gate differs.
 
 * `B2-LLM`: the model's first proposal is executed ungated through the harness root transport,
@@ -196,6 +203,19 @@ are stored in `wp6_manifest.json`). Only the gate differs.
   loop (`candidate_supplier`), so diagnosis, the minimal-impact selector, the policy gate, the
   capability, verification, soak and the audit chain are the ones used by `G`. S5B and S5U run for
   `G-LLM` only, like the other GateHeal-family arms.
+
+**Prompt content.** The prompt lists only actions that are enabled in the action catalogue. An
+earlier draft (`wp7-1`) also listed `restore_last_known_good_config`, which is disabled and has no
+executor, so it was an offer nothing could honour; it is removed.
+
+**Time budget.** GateHeal limits an incident to 45 s of controller time. For `G-LLM` that clock does
+not run while the controller waits for the model (the smoke run saw 10-87 s per answer), so the
+budget keeps its meaning for the recovery actions and verification. The oracle's own clock is
+unaffected: model latency counts fully toward unavailability for both LLM arms. The manifest field
+`planner_latency_excluded_from_controller_budget` records this. The pre-execution recheck still
+compares the evidence from before the model call with fresh evidence after it, so if the lab
+changes during a long model call the action is aborted and escalated (`abort_reason` in the trial
+record); this is the gate working, and it is more likely the slower the model is.
 
 **Model settings.** the model named in `wp6_manifest.json` (see Deviations: the provider's reasoning model
 `deepseek-flash` reached through the gateway `api.mayanext.com`), temperature 0, JSON mode,

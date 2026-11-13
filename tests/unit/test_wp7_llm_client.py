@@ -314,8 +314,13 @@ def test_prompt_is_json_mode_compatible_and_describes_the_lab() -> None:
     cfg = _cfg()
     prompt = build_wp7_system_prompt(cfg)
     assert "json" in prompt.lower()  # required by the provider's JSON mode
+    from gateheal.actions import DEFAULT_ACTION_CATALOGUE
+
     for action in ActionId:
-        assert action.value in prompt
+        spec = DEFAULT_ACTION_CATALOGUE[action]
+        # Only actions the system can execute are offered; a disabled one is an empty promise.
+        assert (action.value in prompt) == spec.enabled, action
+    assert "restore_last_known_good_config" not in prompt
     for unit in cfg.inventory.services:
         assert unit in prompt
     assert "untrusted" in prompt

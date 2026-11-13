@@ -31,11 +31,12 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from gateheal.actions import DEFAULT_ACTION_CATALOGUE
 from gateheal.agent import OpenAICompatibleAgentProposer
 from gateheal.config import GateHealConfig
 from gateheal.models import ActionId, FaultClass
 
-PROMPT_VERSION = "wp7-1"
+PROMPT_VERSION = "wp7-2"
 DEFAULT_ENDPOINT_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL_NAME = "deepseek-chat"
 DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
@@ -100,11 +101,16 @@ class LLMRunInfo(BaseModel):
     max_requests_per_trial: int
     max_total_requests: int | None
     http_timeout_sec: float
+    # True: G-LLM's controller clock (the 45 s incident budget, cooldowns inside the loop) does
+    # not run while it waits for the model. The oracle still counts that time as downtime.
+    planner_latency_excluded_from_controller_budget: bool = True
 
 
 def build_wp7_system_prompt(config: GateHealConfig) -> str:
     """Return the system prompt shared, unchanged, by arms B2-LLM and G-LLM."""
-    actions = ", ".join(a.value for a in ActionId)
+    # Only actions the system can execute: a disabled action (no executor) would be an offer
+    # that nothing can honour. wp7-1 listed restore_last_known_good_config, which is disabled.
+    actions = ", ".join(a.value for a in ActionId if DEFAULT_ACTION_CATALOGUE[a].enabled)
     faults = ", ".join(f.value for f in FaultClass)
     units = sorted(config.inventory.services)
     graph_lines: list[str] = []

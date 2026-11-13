@@ -24,7 +24,8 @@ import platform
 import random
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -197,6 +198,8 @@ class WP6TrialRecord(BaseModel):
     # to a safe command, e.g. a unit outside the lab inventory.
     harness_refusal: str | None = None
     llm_calls: tuple[LLMCallRecord, ...] = ()
+    gate_rejection_codes: tuple[str, ...] = ()
+    abort_reason: str | None = None
     oracle_evaluation: OracleEvaluation | None = None
 
     @model_validator(mode="after")
@@ -481,6 +484,25 @@ def _constant_key_loader(key: bytes) -> Callable[[], bytes | None]:
     return _load
 
 
+class _PlannerExcludedClock:
+    """Monotonic clock that stops while the planner (the hosted model) is thinking."""
+
+    def __init__(self, base: Callable[[], float]) -> None:
+        self._base = base
+        self._excluded_sec = 0.0
+
+    def __call__(self) -> float:
+        return self._base() - self._excluded_sec
+
+    @contextmanager
+    def excluded(self) -> Iterator[None]:
+        started = self._base()
+        try:
+            yield
+        finally:
+            self._excluded_sec += max(0.0, self._base() - started)
+
+
 @dataclass(frozen=True)
 class ArmExecution:
     """What an arm did during its action window (the oracle judges the effect, not this)."""
@@ -494,6 +516,10 @@ class ArmExecution:
     verifier_samples: int
     harness_refusal: str | None = None
     llm_calls: tuple[LLMCallRecord, ...] = ()
+    # Why a GateHeal-family arm did not act: policy rejection codes seen in the final audit step
+    # and, when the pre-execution recheck aborted the action, that abort's reason.
+    gate_rejection_codes: tuple[str, ...] = ()
+    abort_reason: str | None = None
 
     @property
     def mutating_action_taken(self) -> bool:
@@ -801,18 +827,26 @@ class WP6ExperimentRunner:
         attempt: int,
     ) -> ArmExecution:
         candidate_supplier = None
+        controller_clock = self._monotonic_clock
         if arm_id == "G-LLM":
             if self._llm is None:
                 raise ValueError("G-LLM needs an LLM backend.")
             self._llm.drain_calls()
             arm_cfg = self._llm.arm_config(self._base_config)
             llm_proposer = self._llm.make_proposer(self._base_config)
+            # The controller's 45 s incident budget exists to bound recovery actions. Waiting for
+            # a hosted model (10-90 s in the smoke run) must not consume it, or the gate would
+            # abort every slow answer and G-LLM would measure the stopwatch, not the policy.
+            # The oracle's own clock still counts all of that time as downtime.
+            planner_clock = _PlannerExcludedClock(self._monotonic_clock)
+            controller_clock = planner_clock
 
             def candidate_supplier(
                 incident: IncidentRecord, diagnosis: object
             ) -> tuple[ActionProposal, ...]:
                 _ = diagnosis
-                return tuple(llm_proposer.propose(incident).proposals)
+                with planner_clock.excluded():
+                    return tuple(llm_proposer.propose(incident).proposals)
 
         else:
             arm_cfg = make_arm_config(self._base_config, arm_id)
@@ -855,7 +889,7 @@ class WP6ExperimentRunner:
             escalation_sink=EscalationSink(state_dir / f"{incident_id}_esc.jsonl"),
             state_store=state_store,
             clock_utc=self._clock_utc,
-            monotonic_clock=self._monotonic_clock,
+            monotonic_clock=controller_clock,
             sleep_fn=self._sleep_fn,
         )
         audit = orchestrator.handle_incident(
@@ -877,6 +911,21 @@ class WP6ExperimentRunner:
             tuple(recording.mutating_commands),
             audit.verification_report.samples_collected,
             llm_calls=calls,
+            gate_rejection_codes=tuple(
+                sorted(
+                    {
+                        code.value
+                        for decision in audit.policy_decisions
+                        if not decision.approved
+                        for code in decision.rejection_codes
+                    }
+                )
+            ),
+            abort_reason=(
+                audit.selected_proposal.rationale
+                if audit.selected_proposal.rationale.startswith("Aborted execution")
+                else None
+            ),
         )
 
     # ---- one trial -------------------------------------------------------------------
@@ -972,6 +1021,8 @@ class WP6ExperimentRunner:
                 verifier_samples_collected=execution.verifier_samples,
                 harness_refusal=execution.harness_refusal,
                 llm_calls=execution.llm_calls,
+                gate_rejection_codes=execution.gate_rejection_codes,
+                abort_reason=execution.abort_reason,
                 oracle_evaluation=evaluation,
             )
         return WP6TrialRecord(
