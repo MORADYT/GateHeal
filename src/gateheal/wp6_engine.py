@@ -258,6 +258,8 @@ class WP6CoverageRow(BaseModel):
     # WP7: model calls (replayed ones included) and tokens across this arm's records.
     llm_calls: int = 0
     llm_tokens: int = 0
+    # Calls where the model answered in prose instead of the requested JSON.
+    llm_unparseable: int = 0
 
 
 class WP6ArmSummary(BaseModel):
@@ -1252,6 +1254,9 @@ def summarize_wp6_campaign(
             abstained_trials=abstained,
             observe_only_or_noop_trials=max(0, len(evals) - mutating - abstained),
             llm_calls=sum(len(r.llm_calls) for r in arm_recs),
+            llm_unparseable=sum(
+                1 for r in arm_recs for c in r.llm_calls if c.answer_valid is False
+            ),
             llm_tokens=sum(
                 (c.prompt_tokens or 0) + (c.completion_tokens or 0)
                 for r in arm_recs

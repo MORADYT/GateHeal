@@ -32,19 +32,20 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field
 
 from gateheal.actions import DEFAULT_ACTION_CATALOGUE
-from gateheal.agent import OpenAICompatibleAgentProposer
+from gateheal.agent import OpenAICompatibleAgentProposer, _LLMProposalsEnvelope
 from gateheal.config import GateHealConfig
 from gateheal.models import ActionId, FaultClass
 
-PROMPT_VERSION = "wp7-2"
+PROMPT_VERSION = "wp7-3"
 DEFAULT_ENDPOINT_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL_NAME = "deepseek-chat"
 DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
 LLM_MAX_REQUESTS_PER_TRIAL = 3
 # Reasoning models spend part of max_tokens on hidden reasoning before the JSON answer. The WP7
-# smoke run showed 400 tokens truncated 74% of answers, so the default leaves ample headroom.
-DEFAULT_MAX_TOKENS = 4000
-DEFAULT_HTTP_TIMEOUT_SEC = 120.0
+# smoke run showed 400 tokens truncated 74% of answers and 4000 still truncated 7%; some answers
+# use 3500+ reasoning tokens. At roughly 40 tokens/s the HTTP timeout must cover the full budget.
+DEFAULT_MAX_TOKENS = 8000
+DEFAULT_HTTP_TIMEOUT_SEC = 300.0
 RETRYABLE_HTTP_CODES: frozenset[int] = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 FATAL_HTTP_CODES: frozenset[int] = frozenset({401, 402, 403})
 LLMMode = Literal["live", "record", "replay"]
@@ -84,6 +85,9 @@ class LLMCallRecord(BaseModel):
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
     completion_tokens: Annotated[int, Field(ge=0)] = 0
     finish_reason: str | None = None
+    # Whether the model's message was the requested JSON object. False = the model answered in
+    # prose; that is model behaviour (scored as an abstention) but is counted and reported.
+    answer_valid: bool | None = None
 
 
 class LLMRunInfo(BaseModel):
@@ -136,7 +140,9 @@ def build_wp7_system_prompt(config: GateHealConfig) -> str:
         f"Units in this lab: {'; '.join(graph_lines)}. "
         "Prefer the least disruptive action that can fix the fault. "
         "If no registered action can fix it, propose abstain_and_escalate. "
-        "Never include human_approved fields, markdown fences, or shell commands."
+        "Never include human_approved fields, markdown fences, or shell commands. "
+        "Your entire reply must be that single JSON object: no headings, no analysis and no text "
+        "before or after it."
     )
 
 
@@ -196,6 +202,21 @@ _TRUNCATED_MSG = "response truncated at max_tokens (finish_reason=length); raise
 
 def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "[REDACTED]") if secret else text
+
+
+def _answer_valid(raw: str) -> bool | None:
+    """True if the model's message parses as the requested proposals object, else False."""
+    try:
+        content = json.loads(raw)["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    if not isinstance(content, str):
+        return False
+    try:
+        _LLMProposalsEnvelope.model_validate_json(content)
+    except ValueError:  # pydantic.ValidationError is a ValueError
+        return False
+    return True
 
 
 def _usage(raw: str) -> tuple[int, int, str | None]:
@@ -298,6 +319,7 @@ class ResilientLLMSender:
                         finish_reason=fin,
                         error_kind="truncated" if truncated else None,
                         error=_TRUNCATED_MSG if truncated else None,
+                        answer_valid=None if truncated else _answer_valid(cached),
                     )
                 )
                 if truncated:
@@ -382,6 +404,7 @@ class ResilientLLMSender:
                     finish_reason=fin,
                     error_kind="truncated" if truncated else None,
                     error=_TRUNCATED_MSG if truncated else None,
+                    answer_valid=None if truncated else _answer_valid(raw),
                 )
             )
             if self._cassette is not None and self._mode == "record":

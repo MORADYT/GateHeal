@@ -237,7 +237,7 @@ class WP6ReportGenerator:
             [
                 "Arm", "Ungated", "Planned", "Completed", "Evaluable", "Non-evaluable",
                 "Not run", "Retried", "Mutating", "Abstained", "Observe/no-op",
-                "LLM calls", "LLM tokens",
+                "LLM calls", "LLM tokens", "Prose answers",
             ],
             [
                 [
@@ -246,6 +246,7 @@ class WP6ReportGenerator:
                     str(c.non_evaluable_trials), str(c.not_run_trials), str(c.retried_trials),
                     str(c.mutating_trials), str(c.abstained_trials),
                     str(c.observe_only_or_noop_trials), str(c.llm_calls), str(c.llm_tokens),
+                    str(c.llm_unparseable),
                 ]
                 for arm, c in s.coverage.items()
             ],

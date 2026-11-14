@@ -181,6 +181,11 @@ live run, so the following changes made before the full campaign are recorded he
   latency for G-LLM (see section 9), and the prompt no longer lists the disabled restore action
   (`wp7-2`). Trial records also store `gate_rejection_codes` and `abort_reason`, which the first
   records lacked. The smoke output was discarded. No hypothesis, endpoint or test changed.
+* 2026-11-13 (third WP7 smoke run, before any WP7 data was analysed): the gate behaved as designed
+  (no budget aborts; every unapproved restart blocked; two ungated restarts caused collateral
+  harm). 4 of 59 answers still hit the 4000-token cap and 5 of 55 were prose. The token cap is now
+  8000 with a 300 s HTTP timeout, the prompt is `wp7-3`, and prose answers are counted per arm.
+  The smoke output was discarded. No hypothesis, endpoint or test changed.
 * 2026-11-12 (WP7 smoke run, before any WP7 data was analysed): `max_tokens` 400 truncated 31 of 42
   answers of the reasoning model, which were then scored as abstentions. The default is now 4000,
   a truncated answer is an invalid attempt, and the smoke output was discarded. No hypothesis,
@@ -192,7 +197,7 @@ The frozen H1-H3 family above is not changed. WP7 adds two arms and one *seconda
 three hypotheses, analysed on the same oracle, the same scenarios and the same seed.
 
 **Arms.** Both receive the same incident record and the same system prompt (`PROMPT_VERSION`
-`wp7-2`; its SHA-256 and the model, endpoint host, temperature, `max_tokens` and request budgets
+`wp7-3`; its SHA-256 and the model, endpoint host, temperature, `max_tokens` and request budgets
 are stored in `wp6_manifest.json`). Only the gate differs.
 
 * `B2-LLM`: the model's first proposal is executed ungated through the harness root transport,
@@ -208,6 +213,13 @@ are stored in `wp6_manifest.json`). Only the gate differs.
 earlier draft (`wp7-1`) also listed `restore_last_known_good_config`, which is disabled and has no
 executor, so it was an offer nothing could honour; it is removed.
 
+**Output format.** The provider's JSON mode is requested, but a gateway or reasoning model may
+still answer in prose. That is model behaviour: the proposer turns it into a safe abstention for
+both arms, and each such call is flagged (`answer_valid` false) and counted per arm in the coverage
+table ("Prose answers"). In the second smoke run 5 of 55 answers were prose; `wp7-3` adds an
+explicit "the entire reply must be that single JSON object" sentence. The rate is part of the
+result and is reported, not repaired by a retry.
+
 **Time budget.** GateHeal limits an incident to 45 s of controller time. For `G-LLM` that clock does
 not run while the controller waits for the model (the smoke run saw 10-87 s per answer), so the
 budget keeps its meaning for the recovery actions and verification. The oracle's own clock is
@@ -219,9 +231,9 @@ record); this is the gate working, and it is more likely the slower the model is
 
 **Model settings.** the model named in `wp6_manifest.json` (see Deviations: the provider's reasoning model
 `deepseek-flash` reached through the gateway `api.mayanext.com`), temperature 0, JSON mode,
-`max_tokens` 4000, at most 3 requests
+`max_tokens` 8000, at most 3 requests
 per trial (a trial's first call is the only one B2-LLM makes; G-LLM may make more if the model
-proposes a diagnostic action first), 120 s HTTP timeout, at most 3 HTTP tries per request, and a
+proposes a diagnostic action first), 300 s HTTP timeout, at most 3 HTTP tries per request, and a
 campaign-wide cap on live requests. The API key is read from an environment variable and is never
 written to any record, cassette or manifest. Every request and raw response is appended to a
 cassette (`llm_cassette.jsonl`).
@@ -265,7 +277,7 @@ and the same repeat count as the baseline campaign. `lab/scripts/wp6_resummarize
   prompt, this model name and this lab.
 * The model is a reasoning model and the provider is a gateway, so the model behind the name
   cannot be verified; the thesis describes it as the model served under that ID on that date. Its
-  hidden reasoning consumes `max_tokens` and adds seconds of latency (smoke run: mean 9.9 s,
-  maximum 33 s per call).
+  hidden reasoning consumes `max_tokens` and adds seconds of latency (smoke runs: mean 10-23 s,
+  maximum 98 s per call).
 * Incident records (unit states and log excerpts from the lab VM) are sent to a third-party API.
   They contain no personal data.

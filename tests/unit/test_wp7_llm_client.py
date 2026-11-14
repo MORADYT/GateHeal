@@ -117,7 +117,7 @@ def test_success_records_one_call_with_tokens_and_uses_bearer_key_and_own_timeou
     assert call.http_attempts == 1
     _data, headers, timeout = fake.requests[0]
     assert headers["authorization"] == f"Bearer {KEY}"
-    assert timeout == pytest.approx(120.0)  # not the proposer's 10 s action timeout
+    assert timeout == pytest.approx(300.0)  # not the proposer's 10 s action timeout
     assert sender.drain_calls() == ()  # drained
 
 
@@ -168,6 +168,25 @@ def test_partial_json_with_finish_reason_length_is_also_truncated() -> None:
     with pytest.raises(LLMTransportError):
         sender(b"p", 10.0)
     assert sender.drain_calls()[0].error_kind == "truncated"
+
+
+def test_prose_answers_are_flagged_but_not_errors(tmp_path: Path) -> None:
+    prose = _completion("## Verdict\n\nRestart the API.")
+    good = _completion('{"proposals": [{"action_id": "no_op", "rationale": "healthy"}]}')
+    odd = _completion('{"proposals": "nope"}')
+    path = tmp_path / "c.jsonl"
+    sender = _sender(
+        _FakeUrlopen([prose, good, odd]), mode="record", cassette=LLMCassette(path)
+    )
+    for payload in (b"a", b"b", b"c"):
+        sender(payload, 10.0)
+    calls = sender.drain_calls()
+    assert [c.answer_valid for c in calls] == [False, True, False]
+    assert all(c.error_kind is None for c in calls)
+    replay = _sender(_FakeUrlopen([]), mode="replay", cassette=LLMCassette(path), key=None)
+    for payload in (b"a", b"b", b"c"):
+        replay(payload, 10.0)
+    assert [c.answer_valid for c in replay.drain_calls()] == [False, True, False]
 
 
 def test_network_error_backoff_then_success() -> None:
@@ -324,6 +343,7 @@ def test_prompt_is_json_mode_compatible_and_describes_the_lab() -> None:
     for unit in cfg.inventory.services:
         assert unit in prompt
     assert "untrusted" in prompt
+    assert "single JSON object" in prompt and "no headings" in prompt
     assert "least disruptive" in prompt
     assert "approv" not in prompt.lower().replace("human_approved", "")  # no approval hints
     assert system_prompt_sha256(cfg) == sha256_hex(prompt.encode("utf-8"))
@@ -341,8 +361,8 @@ def test_both_arms_get_the_same_request_settings_and_budget() -> None:
     assert info.max_tokens == 321 and info.temperature == 0.0
     assert info.provider_host == "api.deepseek.com"
     assert info.system_prompt_sha256 == system_prompt_sha256(arm_cfg)
-    assert info.mode == "live" and info.http_timeout_sec == pytest.approx(120.0)
-    assert LLMBackend(sender=_sender(_FakeUrlopen([]))).max_tokens == 4000
+    assert info.mode == "live" and info.http_timeout_sec == pytest.approx(300.0)
+    assert LLMBackend(sender=_sender(_FakeUrlopen([]))).max_tokens == 8000
     dumped = info.model_dump_json()
     assert KEY not in dumped
 
