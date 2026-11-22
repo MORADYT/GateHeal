@@ -139,6 +139,17 @@ def test_each_recurrence_signal_alone_is_not_recovered(chg: dict[str, Any]) -> N
     assert rep.status == VerificationStatus.NOT_RECOVERED
 
 
+def test_restart_counter_rising_inside_the_soak_is_caught_after_a_manual_restart_reset() -> None:
+    """D4: a manual restart resets NRestarts to 0, so only the intra-soak rise reveals the crash."""
+    pre = _pre(api_active=False)
+    pre_api = pre.services[API].model_copy(update={"n_restarts": 1})
+    pre = pre.model_copy(update={"services": {**pre.services, API: pre_api}})
+    # Samples report NRestarts 0 and then 1: not above the pre-incident 1, but above sample 1.
+    rep = _verify(_api_changes(nr=1), ActionId.RESTART_SERVICE, pre)
+    assert rep.status == VerificationStatus.NOT_RECOVERED
+    assert "n_restarts 0 -> 1" in rep.details
+
+
 def test_reload_must_not_change_invocation_id() -> None:
     pre = _pre(api_active=True, api_inv=API + "1", api_st=5)
     rep = _verify(

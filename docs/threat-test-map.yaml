@@ -1,0 +1,625 @@
+# GateHeal threat -> control -> test registry (WP8).
+#
+# This file is the single source of truth for docs/threat-test-map.md (generated; do not edit by
+# hand: `uv run python lab/scripts/wp8_threat_map.py --write`). It is checked by
+# tests/security/test_wp8_threat_map.py, which fails when
+#   * a referenced test, source symbol or file no longer exists,
+#   * a doc_anchor is no longer a phrase of docs/threat-model.md,
+#   * a bullet of docs/threat-model.md section 3 is not covered by any threat,
+#   * a mitigated threat has no control or no test, or
+#   * the generated Markdown is out of date.
+#
+# status:
+#   mitigated            a control exists and is pinned by at least one test
+#   partially-mitigated  a control exists and is tested, but a documented residual risk remains
+#   accepted-limitation  not mitigated by design; tests (or an experiment) pin the current behaviour
+#
+# Controls: {path, symbol} for Python (Class.method or a module-level name) or {path, contains}
+# for any other file. Tests are "tests/<file>.py::<test_name>".
+schema_version: 1
+threat_model: docs/threat-model.md
+
+threats:
+  # ------------------------------------------------------------------ Zone 1: lab and host
+  - id: TM-01
+    zone: Z1
+    title: Mutating command runs on the developer workstation instead of the lab guest
+    status: mitigated
+    doc_anchors:
+      - "`LocalLabSubprocessTransport` requires `GATEHEAL_INSIDE_LAB=1`"
+    controls:
+      - {path: src/gateheal/transport.py, symbol: LocalLabSubprocessTransport._verify_inside_lab}
+      - {path: lab/scripts/lab_guard.sh, contains: GATEHEAL_INSIDE_LAB}
+      - {path: src/gateheal/wp6_engine.py, symbol: ensure_transport_sentinel_verified}
+    tests:
+      - tests/security/test_phase2_safety.py::test_local_transport_rejects_host_environment
+      - tests/integration/test_lab_services.py::test_lab_guard_script_refuses_to_run_on_omarchy_host
+      - tests/experiments/test_wp6_campaign_engine.py::test_wp6_ungated_arms_refuse_transport_without_verified_sentinel
+      - tests/security/test_wp8_zone_controls.py::test_local_transport_requires_every_lab_guard_independently
+      - tests/security/test_wp8_zone_controls.py::test_lab_guard_script_requires_every_guard_independently
+
+  - id: TM-02
+    zone: Z1
+    title: SSH transport is pointed at a host that is not the loopback-forwarded lab guest
+    status: mitigated
+    doc_anchors:
+      - "`SSHLabTransport` enforces a loopback target IP"
+    controls:
+      - {path: src/gateheal/transport.py, symbol: _validate_ssh_lab_host}
+    tests:
+      - tests/security/test_phase2_safety.py::test_transport_rejects_non_loopback_hosts
+      - tests/security/test_wp8_zone_controls.py::test_loopback_hosts_are_accepted
+      - tests/security/test_wp8_zone_controls.py::test_ssh_host_must_be_a_loopback_ip_or_localhost
+
+  - id: TM-03
+    zone: Z1
+    title: Option injection through the SSH user name or host argument (for example -oProxyCommand)
+    status: mitigated
+    doc_anchors:
+      - "validates `--ssh-user` against"
+    controls:
+      - {path: src/gateheal/transport.py, symbol: _validate_ssh_user}
+      - {path: src/gateheal/transport.py, symbol: SSHLabTransport.build_ssh_argv}
+    tests:
+      - tests/security/test_wp8_zone_controls.py::test_ssh_user_with_option_injection_is_rejected
+      - tests/security/test_wp8_zone_controls.py::test_ssh_argv_ends_options_before_the_destination
+      - tests/unit/test_wp5_transport_errors.py::test_a2_build_ssh_argv_known_hosts_and_identities_only
+
+  - id: TM-04
+    zone: Z1
+    title: Controller talks to an unverified guest, or an SSH outage is mistaken for a safety verdict
+    status: mitigated
+    doc_anchors:
+      - "distinguishes SSH connectivity failures"
+    controls:
+      - {path: src/gateheal/transport.py, symbol: SSHLabTransport._ensure_remote_sentinel}
+      - {path: src/gateheal/transport.py, symbol: _resolve_known_hosts_file}
+      - {path: src/gateheal/transport.py, symbol: TransportUnavailableError}
+      - {path: src/gateheal/transport.py, symbol: HostSafetyViolationError}
+    tests:
+      - tests/unit/test_wp5_transport_errors.py::test_a1_exit_255_permission_denied_raises_transport_unavailable_error
+      - tests/unit/test_wp5_transport_errors.py::test_a1_exit_1_no_such_file_raises_host_safety_violation_error
+      - tests/unit/test_wp5_transport_errors.py::test_a1_exit_0_wrong_token_raises_host_safety_violation_error
+      - tests/unit/test_wp5_transport_errors.py::test_a1_exit_0_right_token_passes_and_sentinel_cached_across_two_runs
+      - tests/unit/test_wp5_e1_transport.py::test_e1_ssh_sentinel_exit_255_raises_transport_unavailable_with_exit_and_stderr
+      - tests/unit/test_wp5_e1_transport.py::test_e1_ssh_sentinel_wrong_token_with_exit_0_raises_host_safety_violation
+      - tests/unit/test_wp2_wp3_regressions.py::test_wp3_ssh_sentinel_verification_and_remote_timeout_handling
+
+  - id: TM-05
+    zone: Z1
+    title: Privilege escalation through sudo (argument injection, unapproved sub-command, scope wrapping)
+    status: mitigated
+    doc_anchors:
+      - "Mutating service actions execute via"
+      - "Empirical systemd Conformance & Sudoers Negative Isolation (WP5)"
+    controls:
+      - {path: lab/systemd/gateheal-sudoers.conf, contains: "NOPASSWD: /usr/bin/systemctl restart lab-redis.service"}
+      - {path: src/gateheal/actions.py, symbol: ActionSpec.build_argv}
+      - {path: src/gateheal/transport.py, symbol: build_systemd_scope_argv}
+    tests:
+      - tests/lab/test_wp5_real_lab.py::test_wp5_sudoers_negative_commands_are_strictly_outside_allowlist
+      - tests/unit/test_wp2_wp3_regressions.py::test_wp3_sudo_argv_forbids_unprivileged_systemd_scope_wrapping
+      - tests/lab/test_wp5_real_lab.py::test_wp5_conformance_script_and_fixture_facts_cover_all_five_systemd_invariants
+      - tests/security/test_wp8_zone_controls.py::test_sudoers_allowlist_is_exact_and_never_exceeds_what_the_controller_requests
+
+  - id: TM-06
+    zone: Z1
+    title: Controller key is usable as root, or the harness key is pinned to a source address that breaks the lab
+    status: mitigated
+    doc_anchors:
+      - "Dual-Key Controller vs. Harness SSH Separation"
+    controls:
+      - {path: lab/scripts/provision_guest.sh, contains: authorized_keys}
+      - {path: lab/qemu/manage_vm.sh, contains: id_harness_ed25519}
+    tests:
+      - tests/lab/test_wp5_scripts_compile.py::test_lab_scripts_never_pin_harness_key_to_loopback
+      - tests/lab/test_wp5_real_lab.py::test_wp5_live_vm_ssh_conformance_and_captured_fixture_freshness
+
+  - id: TM-07
+    zone: Z1
+    title: Guest initiates outbound network connections (egress from the disposable lab)
+    status: partially-mitigated
+    doc_anchors:
+      - "QEMU user networking runs with `restrict=on`"
+    controls:
+      - {path: lab/qemu/manage_vm.sh, contains: "restrict=on"}
+    tests:
+      - tests/security/test_wp8_zone_controls.py::test_qemu_launch_restricts_guest_egress
+    residual: >-
+      The test pins the QEMU flag in the launch script. No test probes egress from inside a booted
+      guest, so the property is verified statically, not behaviourally.
+
+  # ------------------------------------------------------------------ Zone 2: observation
+  - id: TM-08
+    zone: Z2
+    title: Credentials in service logs reach the advisory plane or an external LLM
+    status: partially-mitigated
+    doc_anchors:
+      - "Best-Effort Log Redaction"
+    controls:
+      - {path: src/gateheal/collector.py, symbol: redact_secrets_text}
+      - {path: src/gateheal/collector.py, symbol: IncidentCollector.redact_secrets}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r11_collector_redacts_multiline_pem_jwt_ghp_aws_secret_and_cookies
+      - tests/lab/test_wp5_collector_on_real_fixtures.py::test_wp5_collector_on_real_fixtures
+    residual: >-
+      Pattern-based: a secret in a format the patterns do not know passes through unredacted.
+
+  - id: TM-09
+    zone: Z2
+    title: Prompt injection through log text steers the advisory plane
+    status: partially-mitigated
+    doc_anchors:
+      - "wraps every log line in `[UNTRUSTED_LOG] `"
+    controls:
+      - {path: src/gateheal/collector.py, symbol: frame_untrusted_log_line}
+      - {path: src/gateheal/llm.py, symbol: build_wp7_system_prompt}
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+    tests:
+      - tests/security/test_wp8_zone_controls.py::test_every_collected_log_line_is_framed_as_untrusted
+      - tests/security/test_wp8_zone_controls.py::test_log_text_cannot_escape_the_untrusted_frame
+      - tests/experiments/test_wp7_llm_arms.py::test_prompt_injection_in_the_model_output_is_just_text
+    residual: >-
+      Framing is a convention the model may ignore. The enforced defence is architectural: the
+      advisory plane has no execution authority and every proposal passes the policy gate (TM-12,
+      TM-13). Measured effect with a real model: H4a and H4c in docs/experiment-design.md section 9.
+    evidence:
+      - "docs/experiment-design.md: H4a"
+
+  - id: TM-10
+    zone: Z2
+    title: Log flooding or oversized lines exhaust the evidence and prompt budget
+    status: mitigated
+    doc_anchors:
+      - "enforces per-line byte caps"
+    controls:
+      - {path: src/gateheal/collector.py, symbol: cap_line_bytes}
+      - {path: src/gateheal/collector.py, symbol: IncidentCollector.collect_simulated}
+      - {path: src/gateheal/collector.py, symbol: IncidentCollector.collect_from_transport}
+    tests:
+      - tests/security/test_wp8_zone_controls.py::test_line_cap_counts_bytes_and_never_splits_a_codepoint
+      - tests/security/test_wp8_zone_controls.py::test_per_service_byte_budget_keeps_the_newest_lines_for_every_service
+      - tests/security/test_wp8_zone_controls.py::test_line_count_cap_keeps_only_the_newest_max_log_lines
+
+  # ------------------------------------------------------------------ Zone 3: advisory plane
+  - id: TM-11
+    zone: Z3
+    title: Proposer names an action outside the closed catalogue, or a registered but disabled one
+    status: mitigated
+    doc_anchors:
+      - "Closed `ActionId` enum lookup"
+      - "Zone 3 (Advisory Plane)"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+      - {path: src/gateheal/models.py, symbol: ActionId}
+      - {path: src/gateheal/actions.py, symbol: ActionSpec}
+    tests:
+      - tests/unit/test_policy_gate.py::test_policy_rejects_unregistered_and_disabled_actions
+      - tests/security/test_phase2_safety.py::test_policy_engine_rejects_unregistered_actions
+      - tests/unit/test_policy_gate.py::test_property_policy_gate_never_approves_unregistered_or_unpermitted_actions
+      - tests/experiments/test_wp7_llm_arms.py::test_hallucinated_actions_are_not_executed_by_either_arm
+      - tests/unit/test_agent_proposer.py::test_config_c_ungated_vs_config_d_policy_gated_llm
+
+  - id: TM-12
+    zone: Z3
+    title: Proposer targets a unit outside the inventory or smuggles malformed or extra parameters
+    status: mitigated
+    doc_anchors:
+      - "strict unit regex"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+      - {path: src/gateheal/actions.py, symbol: UNIT_NAME_RE}
+    tests:
+      - tests/unit/test_policy_gate.py::test_policy_rejects_unauthorized_target
+      - tests/unit/test_policy_gate.py::test_policy_rejects_malformed_parameters_and_self_approval_fields
+      - tests/experiments/test_wp7_llm_arms.py::test_ungated_arm_refuses_non_lab_units_and_records_why
+      - tests/security/test_wp8_zone_controls.py::test_unexpected_action_parameters_are_rejected
+
+  - id: TM-13
+    zone: Z3
+    title: Proposer self-approves, or inflates its own confidence, to obtain a mutation
+    status: mitigated
+    doc_anchors:
+      - "sole minting authority"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.mint_capability}
+      - {path: src/gateheal/diagnosis.py, symbol: DiagnosisEngine.diagnose}
+      - {path: src/gateheal/policy.py, symbol: MinimalImpactSelector.select}
+    tests:
+      - tests/unit/test_policy_gate.py::test_policy_uses_diagnosis_engine_confidence_and_ignores_spoofed_proposer_confidence
+      - tests/unit/test_policy_gate.py::test_selector_prefers_minimal_impact_and_ignores_spoofed_proposer_confidence
+      - tests/unit/test_policy_gate.py::test_policy_rejects_malformed_parameters_and_self_approval_fields
+
+  - id: TM-14
+    zone: Z3
+    title: Malformed, prose, truncated or hostile model output crashes the controller or is executed
+    status: mitigated
+    doc_anchors:
+      - "bounded `AgentProposer` modules"
+    controls:
+      - {path: src/gateheal/agent.py, symbol: OpenAICompatibleAgentProposer.propose}
+      - {path: src/gateheal/llm.py, symbol: _answer_valid}
+    tests:
+      - tests/unit/test_agent_proposer.py::test_openai_proposer_malformed_json_falls_back_to_abstain
+      - tests/experiments/test_wp7_llm_arms.py::test_malformed_model_output_is_model_behaviour_a_safe_abstention
+      - tests/experiments/test_wp7_llm_arms.py::test_prose_answers_are_counted_in_the_coverage_table
+      - tests/experiments/test_wp7_llm_arms.py::test_truncated_answers_are_invalid_not_abstentions_and_retry_can_succeed
+      - tests/experiments/test_wp7_llm_arms.py::test_prompt_injection_in_the_model_output_is_just_text
+
+  - id: TM-15
+    zone: Z3
+    title: Runaway model usage (too many requests, a slow provider) starves the incident budget
+    status: mitigated
+    doc_anchors:
+      - "Possesses zero subprocess execution authority"
+    controls:
+      - {path: src/gateheal/agent.py, symbol: OpenAICompatibleAgentProposer.propose}
+      - {path: src/gateheal/llm.py, symbol: ResilientLLMSender}
+      - {path: src/gateheal/wp6_engine.py, symbol: _PlannerExcludedClock}
+    tests:
+      - tests/unit/test_agent_proposer.py::test_openai_proposer_valid_json_and_budget_enforcement
+      - tests/unit/test_wp7_llm_client.py::test_total_request_cap_counts_every_http_attempt
+      - tests/experiments/test_wp7_llm_arms.py::test_request_cap_stops_the_campaign
+      - tests/experiments/test_wp7_llm_arms.py::test_slow_model_does_not_consume_the_controller_time_budget
+    residual: >-
+      Model latency is excluded from the controller's 45 s budget by design (the oracle still counts
+      it as downtime), so a slow model lengthens the outage but cannot make the gate fail open.
+
+  - id: TM-16
+    zone: Z3
+    title: Provider API key leaks into logs, records, the replay cassette or the manifest
+    status: mitigated
+    doc_anchors:
+      - "Zone 3 (Advisory Plane)"
+    controls:
+      - {path: src/gateheal/llm.py, symbol: _redact}
+      - {path: src/gateheal/llm.py, symbol: env_api_key_loader}
+      - {path: src/gateheal/llm.py, symbol: LLMCassette}
+    tests:
+      - tests/experiments/test_wp7_llm_arms.py::test_key_never_reaches_records_cassette_or_manifest_fields
+      - tests/unit/test_wp7_llm_client.py::test_cassette_never_stores_the_key_and_tolerates_a_torn_last_line
+      - tests/unit/test_wp7_llm_client.py::test_network_errors_are_retried_and_the_key_is_redacted_from_the_record
+      - tests/unit/test_wp7_llm_client.py::test_missing_key_is_fatal_and_sends_nothing
+      - tests/experiments/test_wp7_llm_arms.py::test_manifest_records_llm_provenance_without_the_key
+
+  - id: TM-17
+    zone: Z3
+    title: Provider outage or auth failure is silently scored as a safe abstention
+    status: mitigated
+    doc_anchors:
+      - "bounded `AgentProposer` modules"
+    controls:
+      - {path: src/gateheal/wp6_engine.py, symbol: WP6ExperimentRunner._drain_llm_calls}
+      - {path: src/gateheal/llm.py, symbol: ResilientLLMSender}
+      - {path: src/gateheal/llm.py, symbol: LLMUnavailableError}
+    tests:
+      - tests/experiments/test_wp7_llm_arms.py::test_transport_failure_is_non_evaluable_never_an_abstention
+      - tests/experiments/test_wp7_llm_arms.py::test_auth_failure_stops_the_campaign_instead_of_scoring
+      - tests/experiments/test_wp7_llm_arms.py::test_transient_503_is_absorbed_and_the_trial_is_valid
+      - tests/experiments/test_wp7_llm_arms.py::test_replay_of_an_unrecorded_request_is_invalid_not_scored
+      - tests/unit/test_wp7_llm_client.py::test_auth_and_billing_errors_stop_the_campaign
+
+  # ------------------------------------------------------------------ Zone 4: policy, execution, oracle
+  - id: TM-18
+    zone: Z4
+    title: Forged, replayed, expired or tampered capability executes an action
+    status: mitigated
+    doc_anchors:
+      - "Capability-bound `ExecutionController.execute()`"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.verify_and_consume_capability}
+      - {path: src/gateheal/policy.py, symbol: _compute_capability_mac}
+      - {path: src/gateheal/controller.py, symbol: ExecutionController.execute}
+    tests:
+      - tests/unit/test_recovery_controller.py::test_wp2_capability_bound_execution_blocks_raw_forged_and_replayed_calls
+      - tests/unit/test_wp2_wp3_regressions.py::test_r2_capability_mac_enforces_expiry_timestamp
+      - tests/unit/test_wp2_wp3_regressions.py::test_r3_capability_mac_binds_proposal_and_decision_digest
+      - tests/unit/test_wp4_verifier_oracle.py::test_pre_wp4_capability_requires_explicit_expires_at_and_seed_requires_incident_id
+
+  - id: TM-19
+    zone: Z4
+    title: Incident state changes between the policy decision and execution (time-of-check to time-of-use)
+    status: mitigated
+    doc_anchors:
+      - "TOCTOU state-hash checks"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: compute_incident_state_hash}
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.verify_and_consume_capability}
+      - {path: src/gateheal/orchestrator.py, symbol: IncidentOrchestrator.handle_incident}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r1_verify_and_consume_capability_reruns_policy_evaluate_at_execution_time
+      - tests/unit/test_recovery_controller.py::test_wp2_orchestrator_wal_hash_chain_rotation_and_toctou_abort
+      - tests/unit/test_policy_gate.py::test_state_hash_ignores_logs_and_timestamps_and_tracks_dependents
+      - tests/security/test_wp8_zone_controls.py::test_capability_is_refused_when_the_incident_state_changed_since_issuance
+
+  - id: TM-20
+    zone: Z4
+    title: Operator approval token is forged, reused, expired or signed with a weak key
+    status: partially-mitigated
+    doc_anchors:
+      - "Single-Process Prototype Key Storage"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: verify_approval_token}
+      - {path: src/gateheal/policy.py, symbol: mint_approval_token}
+      - {path: src/gateheal/policy.py, symbol: load_operator_hmac_key}
+    tests:
+      - tests/unit/test_policy_gate.py::test_approval_token_verification_expiry_signature_key_len_and_consumption
+      - tests/experiments/test_wp6_campaign_engine.py::test_wp6_s5b_uses_an_approval_token_and_restarts
+      - tests/security/test_wp8_zone_controls.py::test_approval_token_is_bound_to_its_action_and_target
+      - tests/security/test_wp8_zone_controls.py::test_verify_time_key_length_check_rejects_a_token_signed_with_a_short_key
+      - tests/experiments/test_wp6_campaign_engine.py::test_wp6_s5u_separates_the_blast_radius_gate_from_its_ablation
+    residual: >-
+      The capability secret and the approval key live in the controller's own process memory. A
+      compromised controller process can mint what it can verify; there is no separate signing
+      service in this prototype.
+
+  - id: TM-21
+    zone: Z4
+    title: Policy catalogue is mutated at run time, or empty configuration makes the gate fail open
+    status: mitigated
+    doc_anchors:
+      - "Closed `ActionId` enum lookup"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine}
+      - {path: src/gateheal/actions.py, symbol: DEFAULT_ACTION_CATALOGUE}
+    tests:
+      - tests/unit/test_policy_gate.py::test_t11_default_action_catalogue_is_immutable
+      - tests/unit/test_policy_gate.py::test_empty_catalogue_and_empty_permissions_fail_closed
+      - tests/unit/test_policy_gate.py::test_policy_rejects_unregistered_and_disabled_actions
+
+  - id: TM-22
+    zone: Z4
+    title: Restart storms and flapping through repeated mutating actions
+    status: partially-mitigated
+    doc_anchors:
+      - "Per-incident retry budgets"
+      - "Cross-Incident Restart Bounds"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+      - {path: src/gateheal/state.py, symbol: PersistentStateStore.record_execution}
+    tests:
+      - tests/unit/test_policy_gate.py::test_policy_rejects_when_retry_budget_exhausted
+      - tests/security/test_wp8_zone_controls.py::test_recovery_attempt_budget_is_exhausted_exactly_at_the_limit
+      - tests/unit/test_wp2_wp3_regressions.py::test_r4_attempt_counters_and_action_history_are_keyed_by_incident_id
+      - tests/unit/test_recovery_controller.py::test_wp2_cooldown_flapping_and_unit_lock_enforcement
+    residual: >-
+      Attempt budgets are per incident id (R4). Across distinct incident ids only the per-unit
+      cooldown and the flap window bound repeated mutations.
+
+  - id: TM-23
+    zone: Z4
+    title: Restart of a unit damages healthy dependents (collateral damage / blast radius)
+    status: partially-mitigated
+    doc_anchors:
+      - "Active-Session Coupling vs."
+    controls:
+      - {path: src/gateheal/policy.py, symbol: compute_effective_impact_and_blast_radius}
+      - {path: src/gateheal/policy.py, symbol: collect_transitive_downstream_dependents}
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+    tests:
+      - tests/unit/test_policy_gate.py::test_policy_rejects_restart_when_upstream_dependency_unhealthy
+      - tests/unit/test_policy_gate.py::test_wp1b_blast_radius_table_and_inventory_dilution_invariance
+      - tests/unit/test_wp2_wp3_regressions.py::test_wp3_h3_two_level_transitive_blast_radius_and_unhealthy_exclusion
+      - tests/experiments/test_wp7_llm_arms.py::test_naive_llm_harms_in_the_collateral_trap_ungated_but_is_blocked_when_gated
+      - tests/experiments/test_wp6_campaign_engine.py::test_wp6_s5u_separates_the_blast_radius_gate_from_its_ablation
+    residual: >-
+      The blast-radius model follows the inventory. A systemd PartOf= or BindsTo= coupling that is
+      not encoded in the inventory is invisible to it; the lab avoids those directives on purpose.
+    evidence:
+      - "docs/experiment-design.md: S5U"
+
+  - id: TM-24
+    zone: Z4
+    title: Overlapping mutations of the same unit or of an upstream unit
+    status: mitigated
+    doc_anchors:
+      - "flap counters keyed by the mutated unit"
+    controls:
+      - {path: src/gateheal/state.py, symbol: PersistentStateStore.lock_units}
+      - {path: src/gateheal/state.py, symbol: UnitLockError}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r6_dual_unit_locking_locks_mutated_upstream_unit
+      - tests/unit/test_recovery_controller.py::test_wp2_cooldown_flapping_and_unit_lock_enforcement
+
+  - id: TM-25
+    zone: Z4
+    title: A crash between intent and execution loses attempt counters or consumed tokens
+    status: mitigated
+    doc_anchors:
+      - "Write-ahead"
+    controls:
+      - {path: src/gateheal/orchestrator.py, symbol: IncidentOrchestrator.handle_incident}
+      - {path: src/gateheal/state.py, symbol: PersistentStateStore.save_snapshot}
+      - {path: src/gateheal/controller.py, symbol: AuditRecorder.record}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r7_state_persisted_before_subprocess_execution
+      - tests/unit/test_recovery_controller.py::test_wp2_orchestrator_wal_hash_chain_rotation_and_toctou_abort
+
+  - id: TM-26
+    zone: Z4
+    title: Audit log is edited, truncated or rotated away without detection
+    status: partially-mitigated
+    doc_anchors:
+      - "Unkeyed Audit Hash Chain"
+    controls:
+      - {path: src/gateheal/controller.py, symbol: AuditRecorder.verify_chain}
+      - {path: src/gateheal/controller.py, symbol: compute_audit_record_hash}
+      - {path: src/gateheal/controller.py, symbol: load_audit_hmac_key}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r8_audit_rotation_eviction_preserves_anchor_and_verifies_chain
+      - tests/security/test_wp8_zone_controls.py::test_audit_chain_detects_an_edited_and_a_truncated_record
+      - tests/security/test_wp8_zone_controls.py::test_keyed_audit_chain_rejects_a_recomputed_unkeyed_hash
+    residual: >-
+      Without GATEHEAL_AUDIT_HMAC_KEY held outside the controller's writable directory, the chain is
+      tamper-evident only against accidental damage: a local writer can recompute plain SHA-256.
+
+  - id: TM-27
+    zone: Z4
+    title: A hung action or an orphaned grandchild holding a pipe blocks the controller
+    status: mitigated
+    doc_anchors:
+      - "Bounded `communicate(timeout=...)`"
+    controls:
+      - {path: src/gateheal/transport.py, symbol: run_isolated_process_group}
+      - {path: src/gateheal/transport.py, symbol: build_remote_timeout_argv}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r12_hard_timeout_does_not_hang_when_grandchild_holds_pipe_in_new_session
+      - tests/unit/test_wp4_verifier_oracle.py::test_wp4_6_hung_action_command_marks_outcome_uncertain_with_zero_samples
+      - tests/security/test_wp8_zone_controls.py::test_a_timed_out_process_group_that_ignores_sigterm_is_still_killed
+      - tests/unit/test_wp2_wp3_regressions.py::test_wp3_ssh_sentinel_verification_and_remote_timeout_handling
+
+  - id: TM-28
+    zone: Z4
+    title: An exit code of zero is taken as proof of recovery
+    status: mitigated
+    doc_anchors:
+      - "Independent multi-sample `OutcomeVerifier` soak polling"
+    controls:
+      - {path: src/gateheal/controller.py, symbol: OutcomeVerifier.verify_with_transport}
+      - {path: src/gateheal/controller.py, symbol: OutcomeVerifier._probe_unit_oracle}
+    tests:
+      - tests/unit/test_recovery_controller.py::test_exit_code_zero_does_not_imply_recovery_if_verifier_fails
+      - tests/unit/test_wp4_verifier_oracle.py::test_wp4_1_clean_recovery_across_5_soak_samples
+      - tests/unit/test_wp4_detector_pins.py::test_oracle_tcp_probe_is_authoritative_over_systemd_state
+      - tests/unit/test_wp4_detector_pins.py::test_oracle_http_probe_is_authoritative_over_systemd_state
+
+  - id: TM-29
+    zone: Z4
+    title: Verifier misses a crash after the restart, a flap, a late collateral failure or an uncertain probe
+    status: partially-mitigated
+    doc_anchors:
+      - "Strict All-Samples-Healthy Soak Rule vs. Slow Startup Grace"
+      - "Manual Restart Resets `NRestarts`"
+    controls:
+      - {path: src/gateheal/controller.py, symbol: OutcomeVerifier.verify_with_transport}
+      - {path: src/gateheal/controller.py, symbol: _detect_target_recurrence}
+    tests:
+      - tests/unit/test_wp4_verifier_oracle.py::test_wp4_2_recovery_then_crash_at_t_2s_with_nrestarts_zero
+      - tests/unit/test_wp4_verifier_oracle.py::test_wp4_3_flapping_health_and_mid_soak_invocation_id_or_timestamp_change
+      - tests/unit/test_wp4_verifier_oracle.py::test_wp4_4_probe_timeout_mid_soak_returns_outcome_uncertain
+      - tests/unit/test_wp4_verifier_oracle.py::test_wp4_5_dependent_failing_late_at_t_4s_reports_collateral_failure
+      - tests/unit/test_wp4_detector_pins.py::test_each_recurrence_signal_alone_is_not_recovered
+      - tests/unit/test_wp4_detector_pins.py::test_restart_counter_rising_inside_the_soak_is_caught_after_a_manual_restart_reset
+      - tests/unit/test_wp4_detector_pins.py::test_reload_must_not_change_invocation_id
+      - tests/unit/test_wp4_detector_pins.py::test_reload_must_not_change_exec_main_start_timestamp
+      - tests/unit/test_wp4_detector_pins.py::test_unhealthy_only_in_first_sample_is_not_clean
+      - tests/unit/test_wp2_wp3_regressions.py::test_r9_verifier_does_not_flag_pre_existing_unhealthy_dependent_as_collateral
+      - tests/unit/test_wp2_wp3_regressions.py::test_r10_verifier_detects_transitive_2_hop_collateral_failure
+    residual: >-
+      Every soak sample must be healthy, so a slow-starting service is escalated rather than excused
+      (D2). A crash and respawn before the first sample that leaves NRestarts at zero cannot be told
+      from the requested restart (D4).
+
+  - id: TM-30
+    zone: Z4
+    title: Failed, uncertain or collateral-damaging recovery is not escalated to a human
+    status: mitigated
+    doc_anchors:
+      - "`EscalationSink`"
+    controls:
+      - {path: src/gateheal/controller.py, symbol: EscalationSink.emit}
+      - {path: src/gateheal/orchestrator.py, symbol: IncidentOrchestrator.handle_incident}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_r5_orchestrator_escalates_on_not_recovered_uncertain_and_collateral
+      - tests/unit/test_wp4_t2_live_paths.py::test_t2_orchestrator_handle_incident_without_post_evidence_supplier
+
+  - id: TM-31
+    zone: Z4
+    title: Incident time budget is overrun by collection, action or model latency
+    status: mitigated
+    doc_anchors:
+      - "Zone 4 (Independent Policy, Execution & Oracle Plane)"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+      - {path: src/gateheal/collector.py, symbol: IncidentCollector.collect_from_transport}
+    tests:
+      - tests/unit/test_wp2_wp3_regressions.py::test_wp3_collector_enforces_total_incident_time_budget
+      - tests/unit/test_wp2_wp3_regressions.py::test_r1_verify_and_consume_capability_reruns_policy_evaluate_at_execution_time
+      - tests/experiments/test_wp7_llm_arms.py::test_slow_model_does_not_consume_the_controller_time_budget
+
+  - id: TM-36
+    zone: Z4
+    title: A restart is attempted on a unit whose configuration is invalid or whose validity is unknown
+    status: mitigated
+    doc_anchors:
+      - "Closed `ActionId` enum lookup"
+    controls:
+      - {path: src/gateheal/policy.py, symbol: PolicyEngine.evaluate}
+      - {path: src/gateheal/models.py, symbol: PolicyRejectionCode}
+    tests:
+      - tests/security/test_wp8_zone_controls.py::test_restart_fails_closed_when_config_validity_is_unknown_or_false
+      - tests/unit/test_policy_gate.py::test_wp1b_s2_fault_persists_service_up_outcome
+
+  # ------------------------------------------------------------------ Evaluation and lab limits
+  - id: TM-32
+    zone: X
+    title: The measurement shares code, transport or timing with the system under test
+    status: partially-mitigated
+    doc_anchors:
+      - "Shared Transport/Mechanism Between Collector and Verifier Oracle"
+      - "In-Window Soak Unavailability vs. End-to-End MTTR"
+    controls:
+      - {path: src/gateheal/oracle.py, symbol: IndependentLabOracle}
+      - {path: src/gateheal/models.py, symbol: VerificationReport}
+    tests:
+      - tests/unit/test_wp6_oracle_and_stats.py::test_oracle_import_closure_is_only_transport
+      - tests/unit/test_wp6_oracle_and_stats.py::test_oracle_source_imports_only_allowed_modules
+      - tests/unit/test_wp6_oracle_and_stats.py::test_unavailability_is_integrated_from_the_timeline_not_the_controller_clock
+      - tests/experiments/test_wp6_campaign_engine.py::test_wp6_engine_never_uses_the_removed_oracle_shortcut
+    residual: >-
+      The oracle has its own code path but queries the same systemctl, curl and TCP mechanisms over
+      the same transport type, so a defect in that mechanism could affect controller and oracle
+      alike (D5). Controller-side unavailability is an in-window upper bound; end-to-end MTTR comes
+      only from the harness (D3).
+
+  - id: TM-33
+    zone: X
+    title: The lab worker accepts an unauthenticated abort frame from any local process
+    status: accepted-limitation
+    doc_anchors:
+      - "Unauthenticated Local Worker Abort Frame in Lab Daemon"
+    controls:
+      - {path: src/gateheal/lab_daemons.py, symbol: LabWorkerRuntimeState.handle_frame}
+      - {path: src/gateheal/lab_daemons.py, symbol: notify_worker_of_api_hard_restart}
+    tests:
+      - tests/unit/test_wp4_t2_live_paths.py::test_t2_real_api_subprocess_sigterm_handler_notifies_and_stops_worker_subprocess
+      - tests/integration/test_lab_services.py::test_lab_api_sighup_reload_vs_hard_restart_worker_coupling
+    residual: >-
+      This is a lab-only collateral-damage simulation hook, not a hardened IPC protocol. It exists
+      to make S5 observable and must not be reused outside the disposable guest.
+
+  - id: TM-34
+    zone: X
+    title: The S5 fault is a runtime flag, so results do not transfer to faults that survive a restart
+    status: accepted-limitation
+    doc_anchors:
+      - "S5 Stale-Pool Fault Is Runtime-Only, Not Persisted"
+    controls:
+      - {path: lab/fault_injection/inject_fault.sh, contains: SIGUSR1}
+      - {path: src/gateheal/lab_daemons.py, symbol: LabApiRuntimeState.mark_worker_pool_stale}
+    tests:
+      - tests/unit/test_wp5_live_findings.py::test_inject_s5_does_not_persist_fault_in_config_file
+      - tests/unit/test_wp5_live_findings.py::test_runtime_stale_flag_is_cleared_by_restart_and_sighup
+      - tests/unit/test_wp5_live_findings.py::test_real_api_daemon_sigusr1_degrades_then_restart_and_sighup_recover
+    residual: >-
+      S5 models a stale in-memory pool. A fault that survives restarts is modelled by S2 and S4
+      (invalid configuration), which no arm can repair.
+
+  - id: TM-35
+    zone: X
+    title: Live-lab evidence is over-claimed (one guest image, three repeats, emulated daemons)
+    status: accepted-limitation
+    doc_anchors:
+      - "Live-Lab Validation Scope and Provenance"
+      - "Real-Lab VM Execution"
+    controls:
+      - {path: src/gateheal/lab_bringup.py, symbol: conformance_is_complete_and_passed}
+      - {path: src/gateheal/wp6_engine.py, symbol: validate_wp6_preflight}
+    tests:
+      - tests/unit/test_wp5_live_findings.py::test_conformance_missing_facts_are_not_all_passed
+      - tests/unit/test_wp5_live_findings.py::test_manifest_conformance_not_all_passed_when_facts_truncated
+      - tests/unit/test_wp5_live_findings.py::test_manifest_counts_mismatches_and_flakes_separately
+      - tests/experiments/test_wp6_campaign_engine.py::test_wp6_preflight_checks_wp5_manifest_and_dirty_tree
+    residual: >-
+      Behaviour on other systemd versions, other images or real services is not established. The
+      live-VM tests are skipped unless GATEHEAL_RUN_LAB_TESTS=1 and a guest is booted.
