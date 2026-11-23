@@ -10,3 +10,4 @@ build/
 .env
 artifacts/
 *.qcow2
+project-codebase*.md
