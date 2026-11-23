@@ -129,7 +129,8 @@ Secondary (reported with intervals, not corrected, not used for claims):
 ## 7. Threats to validity and known limitations
 
 * **Single lab, single guest image.** Results describe a three-service systemd lab, not production.
-* **Simulated agent.** B2 uses a deterministic simulated proposer until the real LLM arm (WP7).
+* **Simulated agent.** In the WP6 campaign B2 uses a deterministic simulated proposer. The real
+  model is evaluated separately in the LLM family (section 9).
 * **Oracle resolution.** Sampling is at most every 2 s; sub-interval outages are not seen (the same
   family of limitation as the soak rule D4 in `docs/threat-model.md`).
 * **S2 and S4 look alike to the oracle.** In both, lab-api is already failed before the arm acts

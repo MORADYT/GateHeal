@@ -276,7 +276,7 @@ Tests:
 
 Status: **mitigated**
 
-Threat-model anchors: “bounded `AgentProposer` modules”
+Threat-model anchors: “becomes a safe abstention”; “bounded `AgentProposer` modules”
 
 Controls:
 - `src/gateheal/agent.py` - `OpenAICompatibleAgentProposer.propose`
@@ -293,7 +293,7 @@ Tests:
 
 Status: **mitigated**
 
-Threat-model anchors: “Possesses zero subprocess execution authority”
+Threat-model anchors: “Planner-excluded clock”; “Possesses zero subprocess execution authority”
 
 Controls:
 - `src/gateheal/agent.py` - `OpenAICompatibleAgentProposer.propose`
@@ -312,7 +312,7 @@ Residual risk: Model latency is excluded from the controller's 45 s budget by de
 
 Status: **mitigated**
 
-Threat-model anchors: “Zone 3 (Advisory Plane)”
+Threat-model anchors: “never written to any record, cassette or manifest”; “Zone 3 (Advisory Plane)”
 
 Controls:
 - `src/gateheal/llm.py` - `_redact`
@@ -330,7 +330,7 @@ Tests:
 
 Status: **mitigated**
 
-Threat-model anchors: “bounded `AgentProposer` modules”
+Threat-model anchors: “Provider failures are never scored as abstentions”; “bounded `AgentProposer` modules”
 
 Controls:
 - `src/gateheal/wp6_engine.py` - `WP6ExperimentRunner._drain_llm_calls`

@@ -235,6 +235,7 @@ threats:
     title: Malformed, prose, truncated or hostile model output crashes the controller or is executed
     status: mitigated
     doc_anchors:
+      - "becomes a safe abstention"
       - "bounded `AgentProposer` modules"
     controls:
       - {path: src/gateheal/agent.py, symbol: OpenAICompatibleAgentProposer.propose}
@@ -251,6 +252,7 @@ threats:
     title: Runaway model usage (too many requests, a slow provider) starves the incident budget
     status: mitigated
     doc_anchors:
+      - "Planner-excluded clock"
       - "Possesses zero subprocess execution authority"
     controls:
       - {path: src/gateheal/agent.py, symbol: OpenAICompatibleAgentProposer.propose}
@@ -270,6 +272,7 @@ threats:
     title: Provider API key leaks into logs, records, the replay cassette or the manifest
     status: mitigated
     doc_anchors:
+      - "never written to any record, cassette or manifest"
       - "Zone 3 (Advisory Plane)"
     controls:
       - {path: src/gateheal/llm.py, symbol: _redact}
@@ -287,6 +290,7 @@ threats:
     title: Provider outage or auth failure is silently scored as a safe abstention
     status: mitigated
     doc_anchors:
+      - "Provider failures are never scored as abstentions"
       - "bounded `AgentProposer` modules"
     controls:
       - {path: src/gateheal/wp6_engine.py, symbol: WP6ExperimentRunner._drain_llm_calls}
